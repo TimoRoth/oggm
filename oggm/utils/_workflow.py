@@ -16,6 +16,7 @@ import datetime
 import logging
 import pickle
 import warnings
+import types
 from collections import OrderedDict
 from functools import partial, wraps
 from time import gmtime, strftime
@@ -23,6 +24,8 @@ import fnmatch
 import platform
 import struct
 import importlib
+from abc import ABC, abstractmethod
+from copy import copy
 
 # External libs
 import pandas as pd
@@ -32,6 +35,7 @@ import xarray as xr
 import shapely.geometry as shpg
 from shapely.ops import transform as shp_trafo
 import netCDF4
+import dask
 
 # Optional libs
 try:
@@ -54,13 +58,11 @@ except ImportError:
 
 
 # Locals
+import oggm.cfg as cfg
 from oggm import __version__
 from oggm.utils._funcs import (calendardate_to_hydrodate, date_to_floatyear,
-                               tolist, filter_rgi_name, parse_rgi_meta,
+                               tolist, filter_rgi_name,
                                haversine, multipolygon_to_polygon)
-from oggm.utils._downloads import (get_demo_file, get_wgms_files,
-                                   get_rgi_glacier_entities)
-from oggm import cfg
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 
 
@@ -88,14 +90,6 @@ RGI_DATE = {'01': 2009,
 
 # Module logger
 log = logging.getLogger('.'.join(__name__.split('.')[:-1]))
-
-
-def empty_cache():
-    """Empty oggm's cache directory."""
-
-    if os.path.exists(cfg.CACHE_DIR):
-        shutil.rmtree(cfg.CACHE_DIR)
-    os.makedirs(cfg.CACHE_DIR)
 
 
 def expand_path(p):
@@ -237,19 +231,22 @@ class LRUFileCache():
     The files which are no longer used are deleted from the disk.
     """
 
-    def __init__(self, l0=None, maxsize=None):
+    def __init__(self, oggm, l0=None, maxsize=None):
         """Instanciate.
 
         Parameters
         ----------
+        oggm : instance of ``oggm.OGGM``
+            instance of to get configuration from
         l0 : list
             a list of file paths
         maxsize : int
             the max number of files to keep
         """
+        self.oggm = oggm
         self.files = [] if l0 is None else l0
         # if no maxsize is specified, use value from configuration
-        maxsize = cfg.PARAMS['lru_maxsize'] if maxsize is None else maxsize
+        maxsize = self.oggm.PARAMS['lru_maxsize'] if maxsize is None else maxsize
         self.maxsize = maxsize
         self.purge()
 
@@ -335,1142 +332,6 @@ def include_patterns(*patterns):
     return _ignore_patterns
 
 
-class ncDataset(netCDF4.Dataset):
-    """Wrapper around netCDF4 setting auto_mask to False"""
-
-    def __init__(self, *args, **kwargs):
-        super(ncDataset, self).__init__(*args, **kwargs)
-        self.set_auto_mask(False)
-
-
-def pipe_log(gdir, task_func_name, err=None):
-    """Log the error in a specific directory."""
-
-    time_str = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-
-    # Defaults to working directory: it must be set!
-    if not cfg.PATHS['working_dir']:
-        warnings.warn("Cannot log to file without a valid "
-                      "cfg.PATHS['working_dir']!", RuntimeWarning)
-        return
-
-    fpath = os.path.join(cfg.PATHS['working_dir'], 'log')
-    mkdir(fpath)
-
-    fpath = os.path.join(fpath, gdir.rgi_id)
-
-    sep = '; '
-
-    if err is not None:
-        fpath += '.ERROR'
-    else:
-        return  # for now
-        fpath += '.SUCCESS'
-
-    with open(fpath, 'a') as f:
-        f.write(time_str + sep + task_func_name + sep)
-        if err is not None:
-            f.write(err.__class__.__name__ + sep + '{}\n'.format(err))
-        else:
-            f.write(sep + '\n')
-
-
-class DisableLogger():
-    """Context manager to temporarily disable all loggers."""
-
-    def __enter__(self):
-        logging.disable(logging.ERROR)
-
-    def __exit__(self, a, b, c):
-        logging.disable(logging.NOTSET)
-
-
-def _timeout_handler(signum, frame):
-    raise TimeoutError('This task was killed because of timeout')
-
-
-class entity_task(object):
-    """Decorator for common job-controlling logic.
-
-    All tasks share common operations. This decorator is here to handle them:
-    exceptions, logging, and (some day) database for job-controlling.
-    """
-
-    def __init__(self, log, writes=[], fallback=None):
-        """Decorator syntax: ``@oggm_task(log, writes=['dem', 'outlines'])``
-
-        Parameters
-        ----------
-        log: logger
-            module logger
-        writes: list
-            list of files that the task will write down to disk (must be
-            available in ``cfg.BASENAMES``)
-        fallback: python function
-            will be executed on gdir if entity_task fails
-        """
-        self.log = log
-        self.writes = writes
-        self.fallback = fallback
-
-        cnt = ['    Notes']
-        cnt += ['    -----']
-        cnt += ['    Files writen to the glacier directory:']
-
-        for k in sorted(writes):
-            cnt += [cfg.BASENAMES.doc_str(k)]
-        self.iodoc = '\n'.join(cnt)
-
-    def __call__(self, task_func):
-        """Decorate."""
-
-        # Add to the original docstring
-        if task_func.__doc__ is None:
-            raise RuntimeError('Entity tasks should have a docstring!')
-
-        task_func.__doc__ = '\n'.join((task_func.__doc__, self.iodoc))
-
-        @wraps(task_func)
-        def _entity_task(gdir, *, reset=None, print_log=True, **kwargs):
-
-            if reset is None:
-                reset = not cfg.PARAMS['auto_skip_task']
-
-            task_name = task_func.__name__
-
-            # Filesuffix are typically used to differentiate tasks
-            fsuffix = (kwargs.get('filesuffix', False) or
-                       kwargs.get('output_filesuffix', False))
-            if fsuffix:
-                task_name += fsuffix
-
-            # Do we need to run this task?
-            s = gdir.get_task_status(task_name)
-            if not reset and s and ('SUCCESS' in s):
-                return
-
-            # Log what we are doing
-            if print_log:
-                self.log.info('(%s) %s', gdir.rgi_id, task_name)
-
-            # Run the task
-            try:
-                if cfg.PARAMS['task_timeout'] > 0:
-                    signal.signal(signal.SIGALRM, _timeout_handler)
-                    signal.alarm(cfg.PARAMS['task_timeout'])
-                ex_t = time.time()
-                out = task_func(gdir, **kwargs)
-                ex_t = time.time() - ex_t
-                if cfg.PARAMS['task_timeout'] > 0:
-                    signal.alarm(0)
-                if task_name != 'gdir_to_tar':
-                    gdir.log(task_name, task_time=ex_t)
-            except Exception as err:
-                # Something happened
-                out = None
-                gdir.log(task_name, err=err)
-                pipe_log(gdir, task_name, err=err)
-                if print_log:
-                    self.log.error('%s occurred during task %s on %s: %s',
-                                   type(err).__name__, task_name,
-                                   gdir.rgi_id, str(err))
-                if not cfg.PARAMS['continue_on_error']:
-                    raise
-
-                if self.fallback is not None:
-                    self.fallback(gdir)
-            return out
-
-        _entity_task.__dict__['is_entity_task'] = True
-        return _entity_task
-
-
-def global_task(task_func):
-    """
-    Decorator for common job-controlling logic.
-
-    Indicates that this task expects a list of all GlacierDirs as parameter
-    instead of being called once per dir.
-    """
-
-    task_func.__dict__['global_task'] = True
-    return task_func
-
-
-def _get_centerline_lonlat(gdir):
-    """Quick n dirty solution to write the centerlines as a shapefile"""
-
-    cls = gdir.read_pickle('centerlines')
-    olist = []
-    for j, cl in enumerate(cls[::-1]):
-        mm = 1 if j == 0 else 0
-        gs = dict()
-        gs['RGIID'] = gdir.rgi_id
-        gs['LE_SEGMENT'] = np.rint(np.max(cl.dis_on_line) * gdir.grid.dx)
-        gs['MAIN'] = mm
-        tra_func = partial(gdir.grid.ij_to_crs, crs=wgs84)
-        gs['geometry'] = shp_trafo(tra_func, cl.line)
-        olist.append(gs)
-
-    return olist
-
-
-def write_centerlines_to_shape(gdirs, filesuffix='', path=True):
-    """Write the centerlines in a shapefile.
-
-    Parameters
-    ----------
-    gdirs: the list of GlacierDir to process.
-    filesuffix : str
-        add suffix to output file
-    path:
-        Set to "True" in order  to store the info in the working directory
-        Set to a path to store the file to your chosen location
-    """
-
-    if path is True:
-        path = os.path.join(cfg.PATHS['working_dir'],
-                            'glacier_centerlines' + filesuffix + '.shp')
-
-    olist = []
-    for gdir in gdirs:
-        try:
-            olist.extend(_get_centerline_lonlat(gdir))
-        except FileNotFoundError:
-            pass
-
-    odf = gpd.GeoDataFrame(olist)
-    odf = odf.sort_values(by='RGIID')
-    odf.crs = {'init': 'epsg:4326'}
-    odf.to_file(path)
-
-
-def demo_glacier_id(key):
-    """Get the RGI id of a glacier by name or key: None if not found."""
-
-    df = cfg.DATA['demo_glaciers']
-
-    # Is the name in key?
-    s = df.loc[df.Key.str.lower() == key.lower()]
-    if len(s) == 1:
-        return s.index[0]
-
-    # Is the name in name?
-    s = df.loc[df.Name.str.lower() == key.lower()]
-    if len(s) == 1:
-        return s.index[0]
-
-    # Is the name in Ids?
-    try:
-        s = df.loc[[key]]
-        if len(s) == 1:
-            return s.index[0]
-    except KeyError:
-        pass
-
-    return None
-
-
-class compile_to_netcdf(object):
-    """Decorator for common compiling NetCDF files logic.
-
-    All compile_* tasks can be optimized the same way, by using temporary
-    files and merging them afterwards.
-    """
-
-    def __init__(self, log):
-        """Decorator syntax: ``@compile_to_netcdf(log, n_tmp_files=1000)``
-
-        Parameters
-        ----------
-        log: logger
-            module logger
-        tmp_file_size: int
-            number of glacier directories per temporary files
-        """
-        self.log = log
-
-    def __call__(self, task_func):
-        """Decorate."""
-
-        @wraps(task_func)
-        def _compile_to_netcdf(gdirs, filesuffix='', input_filesuffix='',
-                               output_filesuffix='', path=True,
-                               tmp_file_size=1000,
-                               **kwargs):
-
-            # Check input
-            if filesuffix:
-                warnings.warn('The `filesuffix` kwarg is deprecated for '
-                              'compile_* tasks. Use input_filesuffix from '
-                              'now on.',
-                              DeprecationWarning)
-                input_filesuffix = filesuffix
-
-            if not output_filesuffix:
-                output_filesuffix = input_filesuffix
-
-            gdirs = tolist(gdirs)
-
-            hemisphere = [gd.hemisphere for gd in gdirs]
-            if len(np.unique(hemisphere)) == 2:
-                if path is not True:
-                    raise InvalidParamsError('With glaciers from both '
-                                             'hemispheres, set `path=True`.')
-                self.log.warning('compile_*: you gave me a list of gdirs from '
-                                 'both hemispheres. I am going to write two '
-                                 'files out of it with _sh and _nh suffixes.')
-                _gdirs = [gd for gd in gdirs if gd.hemisphere == 'sh']
-                _compile_to_netcdf(_gdirs,
-                                   input_filesuffix=input_filesuffix,
-                                   output_filesuffix=output_filesuffix + '_sh',
-                                   path=True,
-                                   tmp_file_size=tmp_file_size,
-                                   **kwargs)
-                _gdirs = [gd for gd in gdirs if gd.hemisphere == 'nh']
-                _compile_to_netcdf(_gdirs,
-                                   input_filesuffix=input_filesuffix,
-                                   output_filesuffix=output_filesuffix + '_nh',
-                                   path=True,
-                                   tmp_file_size=tmp_file_size,
-                                   **kwargs)
-                return
-
-            task_name = task_func.__name__
-            output_base = task_name.replace('compile_', '')
-
-            if path is True:
-                path = os.path.join(cfg.PATHS['working_dir'],
-                                    output_base + output_filesuffix + '.nc')
-
-            self.log.info('Applying %s on %d gdirs.',
-                          task_name, len(gdirs))
-
-            # Run the task
-            # If small gdir size, no need for temporary files
-            if len(gdirs) < tmp_file_size or not path:
-                return task_func(gdirs, input_filesuffix=input_filesuffix,
-                                 path=path, **kwargs)
-
-            # Otherwise, divide and conquer
-            sub_gdirs = [gdirs[i: i + tmp_file_size] for i in
-                         range(0, len(gdirs), tmp_file_size)]
-
-            tmp_paths = [os.path.join(cfg.PATHS['working_dir'],
-                                      'compile_tmp_{:06d}.nc'.format(i))
-                         for i in range(len(sub_gdirs))]
-
-            try:
-                for spath, sgdirs in zip(tmp_paths, sub_gdirs):
-                    task_func(sgdirs, input_filesuffix=input_filesuffix,
-                              path=spath, **kwargs)
-            except BaseException:
-                # If something wrong, delete the tmp files
-                for f in tmp_paths:
-                    try:
-                        os.remove(f)
-                    except FileNotFoundError:
-                        pass
-                raise
-
-            # Ok, now merge and return
-            try:
-                with xr.open_mfdataset(tmp_paths, combine='nested',
-                                       concat_dim='rgi_id') as ds:
-                    ds.to_netcdf(path)
-            except TypeError:
-                # xr < v 0.13
-                with xr.open_mfdataset(tmp_paths, concat_dim='rgi_id') as ds:
-                    ds.to_netcdf(path)
-
-            # We can't return the dataset without loading it, so we don't
-            return None
-
-        return _compile_to_netcdf
-
-
-@compile_to_netcdf(log)
-def compile_run_output(gdirs, path=True, input_filesuffix='',
-                       use_compression=True):
-    """Merge the output of the model runs of several gdirs into one file.
-
-    Parameters
-    ----------
-    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
-        the glacier directories to process
-    path : str
-        where to store (default is on the working dir).
-        Set to `False` to disable disk storage.
-    input_filesuffix : str
-        the filesuffix of the files to be compiled
-    use_compression : bool
-        use zlib compression on the output netCDF files
-
-    Returns
-    -------
-    ds : :py:class:`xarray.Dataset`
-        compiled output
-    """
-
-    # Get the dimensions of all this
-    rgi_ids = [gd.rgi_id for gd in gdirs]
-
-    # The first gdir might have blown up, try some others
-    i = 0
-    while True:
-        if i >= len(gdirs):
-            raise RuntimeError('Found no valid glaciers!')
-        try:
-            ppath = gdirs[i].get_filepath('model_diagnostics',
-                                          filesuffix=input_filesuffix)
-            with xr.open_dataset(ppath) as ds_diag:
-                ds_diag.time.values
-            break
-        except BaseException:
-            i += 1
-
-    # OK found it, open it and prepare the output
-    with xr.open_dataset(ppath) as ds_diag:
-        time = ds_diag.time.values
-        yrs = ds_diag.hydro_year.values
-        months = ds_diag.hydro_month.values
-        cyrs = ds_diag.calendar_year.values
-        cmonths = ds_diag.calendar_month.values
-
-        # Prepare output
-        ds = xr.Dataset()
-
-        # Global attributes
-        ds.attrs['description'] = 'OGGM model output'
-        ds.attrs['oggm_version'] = __version__
-        ds.attrs['calendar'] = '365-day no leap'
-        ds.attrs['creation_date'] = strftime("%Y-%m-%d %H:%M:%S", gmtime())
-
-        # Coordinates
-        ds.coords['time'] = ('time', time)
-        ds.coords['rgi_id'] = ('rgi_id', rgi_ids)
-        ds.coords['hydro_year'] = ('time', yrs)
-        ds.coords['hydro_month'] = ('time', months)
-        ds.coords['calendar_year'] = ('time', cyrs)
-        ds.coords['calendar_month'] = ('time', cmonths)
-        ds['time'].attrs['description'] = 'Floating hydrological year'
-        ds['rgi_id'].attrs['description'] = 'RGI glacier identifier'
-        ds['hydro_year'].attrs['description'] = 'Hydrological year'
-        ds['hydro_month'].attrs['description'] = 'Hydrological month'
-        ds['calendar_year'].attrs['description'] = 'Calendar year'
-        ds['calendar_month'].attrs['description'] = 'Calendar month'
-
-    shape = (len(time), len(rgi_ids))
-    # These variables are always available
-    vol = np.zeros(shape)
-    area = np.zeros(shape)
-    length = np.zeros(shape)
-    ela = np.zeros(shape)
-    # These are not
-    calving_m3 = None
-    calving_rate_myr = None
-    volume_bsl_m3 = None
-    volume_bwl_m3 = None
-    for i, gdir in enumerate(gdirs):
-        try:
-            ppath = gdir.get_filepath('model_diagnostics',
-                                      filesuffix=input_filesuffix)
-            with xr.open_dataset(ppath) as ds_diag:
-                vol[:, i] = ds_diag.volume_m3.values
-                area[:, i] = ds_diag.area_m2.values
-                length[:, i] = ds_diag.length_m.values
-                ela[:, i] = ds_diag.ela_m.values
-                if 'calving_m3' in ds_diag:
-                    if calving_m3 is None:
-                        calving_m3 = np.zeros(shape) * np.NaN
-                    calving_m3[:, i] = ds_diag.calving_m3.values
-                if 'calving_rate_myr' in ds_diag:
-                    if calving_rate_myr is None:
-                        calving_rate_myr = np.zeros(shape) * np.NaN
-                    calving_rate_myr[:, i] = ds_diag.calving_rate_myr.values
-                if 'volume_bsl_m3' in ds_diag:
-                    if volume_bsl_m3 is None:
-                        volume_bsl_m3 = np.zeros(shape) * np.NaN
-                    volume_bsl_m3[:, i] = ds_diag.volume_bsl_m3.values
-                if 'volume_bwl_m3' in ds_diag:
-                    if volume_bwl_m3 is None:
-                        volume_bwl_m3 = np.zeros(shape) * np.NaN
-                    volume_bwl_m3[:, i] = ds_diag.volume_bwl_m3.values
-        except BaseException:
-            vol[:, i] = np.NaN
-            area[:, i] = np.NaN
-            length[:, i] = np.NaN
-            ela[:, i] = np.NaN
-
-    ds['volume'] = (('time', 'rgi_id'), vol)
-    ds['volume'].attrs['description'] = 'Total glacier volume'
-    ds['volume'].attrs['units'] = 'm 3'
-    ds['area'] = (('time', 'rgi_id'), area)
-    ds['area'].attrs['description'] = 'Total glacier area'
-    ds['area'].attrs['units'] = 'm 2'
-    ds['length'] = (('time', 'rgi_id'), length)
-    ds['length'].attrs['description'] = 'Glacier length'
-    ds['length'].attrs['units'] = 'm'
-    ds['ela'] = (('time', 'rgi_id'), ela)
-    ds['ela'].attrs['description'] = 'Glacier Equilibrium Line Altitude (ELA)'
-    ds['ela'].attrs['units'] = 'm a.s.l'
-    if calving_m3 is not None:
-        ds['calving'] = (('time', 'rgi_id'), calving_m3)
-        ds['calving'].attrs['description'] = ('Total calving volume since '
-                                              'simulation start')
-        ds['calving'].attrs['units'] = 'm3'
-    if calving_rate_myr is not None:
-        ds['calving_rate'] = (('time', 'rgi_id'), calving_rate_myr)
-        ds['calving_rate'].attrs['description'] = 'Instantaneous calving rate'
-        ds['calving_rate'].attrs['units'] = 'm yr-1'
-    if volume_bsl_m3 is not None:
-        ds['volume_bsl'] = (('time', 'rgi_id'), volume_bsl_m3)
-        ds['volume_bsl'].attrs['description'] = ('Total glacier volume below '
-                                                 'sea level')
-        ds['volume_bsl'].attrs['units'] = 'm3'
-    if volume_bwl_m3 is not None:
-        ds['volume_bwl'] = (('time', 'rgi_id'), volume_bwl_m3)
-        ds['volume_bwl'].attrs['description'] = ('Total glacier volume below '
-                                                 'water level')
-        ds['volume_bwl'].attrs['units'] = 'm3'
-
-    if path:
-        enc_var = {'dtype': 'float32'}
-        if use_compression:
-            enc_var['complevel'] = 5
-            enc_var['zlib'] = True
-        encoding = {v: enc_var for v in ['volume', 'area', 'length', 'ela']}
-        ds.to_netcdf(path, encoding=encoding)
-
-    return ds
-
-
-@compile_to_netcdf(log)
-def compile_climate_input(gdirs, path=True, filename='climate_historical',
-                          input_filesuffix='', use_compression=True):
-    """Merge the climate input files in the glacier directories into one file.
-
-    Parameters
-    ----------
-    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
-        the glacier directories to process
-    path : str
-        where to store (default is on the working dir).
-        Set to `False` to disable disk storage.
-    filename : str
-        BASENAME of the climate input files
-    input_filesuffix : str
-        the filesuffix of the files to be compiled
-    use_compression : bool
-        use zlib compression on the output netCDF files
-
-    Returns
-    -------
-    ds : :py:class:`xarray.Dataset`
-        compiled climate data
-    """
-
-    # Get the dimensions of all this
-    rgi_ids = [gd.rgi_id for gd in gdirs]
-
-    # The first gdir might have blown up, try some others
-    i = 0
-    while True:
-        if i >= len(gdirs):
-            raise RuntimeError('Found no valid glaciers!')
-        try:
-            pgdir = gdirs[i]
-            ppath = pgdir.get_filepath(filename=filename,
-                                       filesuffix=input_filesuffix)
-            with xr.open_dataset(ppath) as ds_clim:
-                ds_clim.time.values
-            # If this worked, we have a valid gdir
-            break
-        except BaseException:
-            i += 1
-
-    with xr.open_dataset(ppath) as ds_clim:
-        cyrs = ds_clim['time.year']
-        cmonths = ds_clim['time.month']
-        has_grad = 'gradient' in ds_clim.variables
-        sm = cfg.PARAMS['hydro_month_' + pgdir.hemisphere]
-        yrs, months = calendardate_to_hydrodate(cyrs, cmonths, start_month=sm)
-        assert months[0] == 1, 'Expected the first hydro month to be 1'
-        time = date_to_floatyear(yrs, months)
-
-    # Prepare output
-    ds = xr.Dataset()
-
-    # Global attributes
-    ds.attrs['description'] = 'OGGM model output'
-    ds.attrs['oggm_version'] = __version__
-    ds.attrs['calendar'] = '365-day no leap'
-    ds.attrs['creation_date'] = strftime("%Y-%m-%d %H:%M:%S", gmtime())
-
-    # Coordinates
-    ds.coords['time'] = ('time', time)
-    ds.coords['rgi_id'] = ('rgi_id', rgi_ids)
-    ds.coords['hydro_year'] = ('time', yrs)
-    ds.coords['hydro_month'] = ('time', months)
-    ds.coords['calendar_year'] = ('time', cyrs)
-    ds.coords['calendar_month'] = ('time', cmonths)
-    ds['time'].attrs['description'] = 'Floating hydrological year'
-    ds['rgi_id'].attrs['description'] = 'RGI glacier identifier'
-    ds['hydro_year'].attrs['description'] = 'Hydrological year'
-    ds['hydro_month'].attrs['description'] = 'Hydrological month'
-    ds['calendar_year'].attrs['description'] = 'Calendar year'
-    ds['calendar_month'].attrs['description'] = 'Calendar month'
-
-    shape = (len(time), len(rgi_ids))
-    temp = np.zeros(shape) * np.NaN
-    prcp = np.zeros(shape) * np.NaN
-    if has_grad:
-        grad = np.zeros(shape) * np.NaN
-    ref_hgt = np.zeros(len(rgi_ids)) * np.NaN
-    ref_pix_lon = np.zeros(len(rgi_ids)) * np.NaN
-    ref_pix_lat = np.zeros(len(rgi_ids)) * np.NaN
-
-    for i, gdir in enumerate(gdirs):
-        try:
-            ppath = gdir.get_filepath(filename=filename,
-                                      filesuffix=input_filesuffix)
-            with xr.open_dataset(ppath) as ds_clim:
-                prcp[:, i] = ds_clim.prcp.values
-                temp[:, i] = ds_clim.temp.values
-                if has_grad:
-                    grad[:, i] = ds_clim.gradient
-                ref_hgt[i] = ds_clim.ref_hgt
-                ref_pix_lon[i] = ds_clim.ref_pix_lon
-                ref_pix_lat[i] = ds_clim.ref_pix_lat
-        except BaseException:
-            pass
-
-    ds['temp'] = (('time', 'rgi_id'), temp)
-    ds['temp'].attrs['units'] = 'DegC'
-    ds['temp'].attrs['description'] = '2m Temperature at height ref_hgt'
-    ds['prcp'] = (('time', 'rgi_id'), prcp)
-    ds['prcp'].attrs['units'] = 'kg m-2'
-    ds['prcp'].attrs['description'] = 'total monthly precipitation amount'
-    if has_grad:
-        ds['grad'] = (('time', 'rgi_id'), grad)
-        ds['grad'].attrs['units'] = 'degC m-1'
-        ds['grad'].attrs['description'] = 'temperature gradient'
-    ds['ref_hgt'] = ('rgi_id', ref_hgt)
-    ds['ref_hgt'].attrs['units'] = 'm'
-    ds['ref_hgt'].attrs['description'] = 'reference height'
-    ds['ref_pix_lon'] = ('rgi_id', ref_pix_lon)
-    ds['ref_pix_lon'].attrs['description'] = 'longitude'
-    ds['ref_pix_lat'] = ('rgi_id', ref_pix_lat)
-    ds['ref_pix_lat'].attrs['description'] = 'latitude'
-
-    if path:
-        enc_var = {'dtype': 'float32'}
-        if use_compression:
-            enc_var['complevel'] = 5
-            enc_var['zlib'] = True
-        vars = ['temp', 'prcp']
-        if has_grad:
-            vars += ['grad']
-        encoding = {v: enc_var for v in vars}
-        ds.to_netcdf(path, encoding=encoding)
-    return ds
-
-
-def compile_task_log(gdirs, task_names=[], filesuffix='', path=True,
-                     append=True):
-    """Gathers the log output for the selected task(s)
-
-    Parameters
-    ----------
-    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
-        the glacier directories to process
-    task_names : list of str
-        The tasks to check for
-    filesuffix : str
-        add suffix to output file
-    path:
-        Set to `True` in order  to store the info in the working directory
-        Set to a path to store the file to your chosen location
-        Set to `False` to omit disk storage
-    append:
-        If a task log file already exists in the working directory, the new
-        logs will be added to the existing file
-
-    Returns
-    -------
-    out : :py:class:`pandas.DataFrame`
-        log output
-    """
-
-    out_df = []
-    for gdir in gdirs:
-        d = OrderedDict()
-        d['rgi_id'] = gdir.rgi_id
-        for task_name in task_names:
-            ts = gdir.get_task_status(task_name)
-            if ts is None:
-                ts = ''
-            d[task_name] = ts.replace(',', ' ')
-        out_df.append(d)
-
-    out = pd.DataFrame(out_df).set_index('rgi_id')
-    if path:
-        if path is True:
-            path = os.path.join(cfg.PATHS['working_dir'],
-                                'task_log' + filesuffix + '.csv')
-        if os.path.exists(path) and append:
-            odf = pd.read_csv(path, index_col=0)
-            out = odf.join(out, rsuffix='_n')
-        out.to_csv(path)
-    return out
-
-
-def compile_task_time(gdirs, task_names=[], filesuffix='', path=True,
-                      append=True):
-    """Gathers the time needed for the selected task(s) to run
-
-    Parameters
-    ----------
-    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
-        the glacier directories to process
-    task_names : list of str
-        The tasks to check for
-    filesuffix : str
-        add suffix to output file
-    path:
-        Set to `True` in order  to store the info in the working directory
-        Set to a path to store the file to your chosen location
-        Set to `False` to omit disk storage
-    append:
-        If a task log file already exists in the working directory, the new
-        logs will be added to the existing file
-
-    Returns
-    -------
-    out : :py:class:`pandas.DataFrame`
-        log output
-    """
-
-    out_df = []
-    for gdir in gdirs:
-        d = OrderedDict()
-        d['rgi_id'] = gdir.rgi_id
-        for task_name in task_names:
-            d[task_name] = gdir.get_task_time(task_name)
-        out_df.append(d)
-
-    out = pd.DataFrame(out_df).set_index('rgi_id')
-    if path:
-        if path is True:
-            path = os.path.join(cfg.PATHS['working_dir'],
-                                'task_time' + filesuffix + '.csv')
-        if os.path.exists(path) and append:
-            odf = pd.read_csv(path, index_col=0)
-            out = odf.join(out, rsuffix='_n')
-        out.to_csv(path)
-    return out
-
-
-@entity_task(log)
-def glacier_statistics(gdir, inversion_only=False):
-    """Gather as much statistics as possible about this glacier.
-
-    It can be used to do result diagnostics and other stuffs. If the data
-    necessary for a statistic is not available (e.g.: flowlines length) it
-    will simply be ignored.
-
-    Parameters
-    ----------
-    inversion_only : bool
-        if one wants to summarize the inversion output only (including calving)
-    """
-
-    d = OrderedDict()
-
-    # Easy stats - this should always be possible
-    d['rgi_id'] = gdir.rgi_id
-    d['rgi_region'] = gdir.rgi_region
-    d['rgi_subregion'] = gdir.rgi_subregion
-    d['name'] = gdir.name
-    d['cenlon'] = gdir.cenlon
-    d['cenlat'] = gdir.cenlat
-    d['rgi_area_km2'] = gdir.rgi_area_km2
-    d['glacier_type'] = gdir.glacier_type
-    d['terminus_type'] = gdir.terminus_type
-    d['status'] = gdir.status
-
-    # The rest is less certain. We put these in a try block and see
-    # We're good with any error - we store the dict anyway below
-    # TODO: should be done with more preselected errors
-    try:
-        # Inversion
-        if gdir.has_file('inversion_output'):
-            vol = []
-            cl = gdir.read_pickle('inversion_output')
-            for c in cl:
-                vol.extend(c['volume'])
-            d['inv_volume_km3'] = np.nansum(vol) * 1e-9
-            area = gdir.rgi_area_km2
-            d['inv_thickness_m'] = d['inv_volume_km3'] / area * 1000
-            d['vas_volume_km3'] = 0.034 * (area ** 1.375)
-            d['vas_thickness_m'] = d['vas_volume_km3'] / area * 1000
-    except BaseException:
-        pass
-
-    try:
-        # Diagnostics
-        diags = gdir.get_diagnostics()
-        for k, v in diags.items():
-            d[k] = v
-    except BaseException:
-        pass
-
-    if inversion_only:
-        return d
-
-    try:
-        # Error log
-        errlog = gdir.get_error_log()
-        if errlog is not None:
-            d['error_task'] = errlog.split(';')[-2]
-            d['error_msg'] = errlog.split(';')[-1]
-        else:
-            d['error_task'] = None
-            d['error_msg'] = None
-    except BaseException:
-        pass
-
-    try:
-        # Masks related stuff
-        fpath = gdir.get_filepath('gridded_data')
-        with ncDataset(fpath) as nc:
-            mask = nc.variables['glacier_mask'][:]
-            topo = nc.variables['topo'][:]
-        d['dem_mean_elev'] = np.mean(topo[np.where(mask == 1)])
-        d['dem_med_elev'] = np.median(topo[np.where(mask == 1)])
-        d['dem_min_elev'] = np.min(topo[np.where(mask == 1)])
-        d['dem_max_elev'] = np.max(topo[np.where(mask == 1)])
-    except BaseException:
-        pass
-
-    try:
-        # Ext related stuff
-        fpath = gdir.get_filepath('gridded_data')
-        with ncDataset(fpath) as nc:
-            ext = nc.variables['glacier_ext'][:]
-            mask = nc.variables['glacier_mask'][:]
-            topo = nc.variables['topo'][:]
-        d['dem_max_elev_on_ext'] = np.max(topo[np.where(ext == 1)])
-        d['dem_min_elev_on_ext'] = np.min(topo[np.where(ext == 1)])
-        a = np.sum(mask & (topo > d['dem_max_elev_on_ext']))
-        d['dem_perc_area_above_max_elev_on_ext'] = a / np.sum(mask)
-    except BaseException:
-        pass
-
-    try:
-        # Centerlines
-        cls = gdir.read_pickle('centerlines')
-        longuest = 0.
-        for cl in cls:
-            longuest = np.max([longuest, cl.dis_on_line[-1]])
-        d['n_centerlines'] = len(cls)
-        d['longuest_centerline_km'] = longuest * gdir.grid.dx / 1000.
-    except BaseException:
-        pass
-
-    try:
-        # Flowline related stuff
-        h = np.array([])
-        widths = np.array([])
-        slope = np.array([])
-        fls = gdir.read_pickle('inversion_flowlines')
-        dx = fls[0].dx * gdir.grid.dx
-        for fl in fls:
-            hgt = fl.surface_h
-            h = np.append(h, hgt)
-            widths = np.append(widths, fl.widths * gdir.grid.dx)
-            slope = np.append(slope, np.arctan(-np.gradient(hgt, dx)))
-            length = len(hgt) * dx
-        d['main_flowline_length'] = length
-        d['inv_flowline_glacier_area'] = np.sum(widths * dx)
-        d['flowline_mean_elev'] = np.average(h, weights=widths)
-        d['flowline_max_elev'] = np.max(h)
-        d['flowline_min_elev'] = np.min(h)
-        d['flowline_avg_width'] = np.mean(widths)
-        d['flowline_avg_slope'] = np.mean(slope)
-    except BaseException:
-        pass
-
-    try:
-        # MB calib
-        df = gdir.read_json('local_mustar')
-        d['t_star'] = df['t_star']
-        d['mu_star_glacierwide'] = df['mu_star_glacierwide']
-        d['mu_star_flowline_avg'] = df['mu_star_flowline_avg']
-        d['mu_star_allsame'] = df['mu_star_allsame']
-        d['mb_bias'] = df['bias']
-    except BaseException:
-        pass
-
-    return d
-
-
-def compile_glacier_statistics(gdirs, filesuffix='', path=True,
-                               inversion_only=False):
-    """Gather as much statistics as possible about a list of glaciers.
-
-    It can be used to do result diagnostics and other stuffs. If the data
-    necessary for a statistic is not available (e.g.: flowlines length) it
-    will simply be ignored.
-
-    Parameters
-    ----------
-    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
-        the glacier directories to process
-    filesuffix : str
-        add suffix to output file
-    path : str, bool
-        Set to "True" in order  to store the info in the working directory
-        Set to a path to store the file to your chosen location
-    inversion_only : bool
-        if one wants to summarize the inversion output only (including calving)
-    """
-    from oggm.workflow import execute_entity_task
-
-    out_df = execute_entity_task(glacier_statistics, gdirs,
-                                 inversion_only=inversion_only)
-
-    out = pd.DataFrame(out_df).set_index('rgi_id')
-    if path:
-        if path is True:
-            out.to_csv(os.path.join(cfg.PATHS['working_dir'],
-                                    ('glacier_statistics' +
-                                     filesuffix + '.csv')))
-        else:
-            out.to_csv(path)
-    return out
-
-
-@entity_task(log)
-def climate_statistics(gdir, add_climate_period=1995):
-    """Gather as much statistics as possible about this glacier.
-
-    It can be used to do result diagnostics and other stuffs. If the data
-    necessary for a statistic is not available (e.g.: flowlines length) it
-    will simply be ignored.
-
-    Parameters
-    ----------
-    add_climate_period : int or list of ints
-        compile climate statistics for the 30 yrs period around the selected
-        date.
-    """
-
-    from oggm.core.massbalance import (ConstantMassBalance,
-                                       MultipleFlowlineMassBalance)
-
-    d = OrderedDict()
-
-    # Easy stats - this should always be possible
-    d['rgi_id'] = gdir.rgi_id
-    d['rgi_region'] = gdir.rgi_region
-    d['rgi_subregion'] = gdir.rgi_subregion
-    d['name'] = gdir.name
-    d['cenlon'] = gdir.cenlon
-    d['cenlat'] = gdir.cenlat
-    d['rgi_area_km2'] = gdir.rgi_area_km2
-    d['glacier_type'] = gdir.glacier_type
-    d['terminus_type'] = gdir.terminus_type
-    d['status'] = gdir.status
-
-    # The rest is less certain
-
-    try:
-        # Flowline related stuff
-        h = np.array([])
-        widths = np.array([])
-        fls = gdir.read_pickle('inversion_flowlines')
-        dx = fls[0].dx * gdir.grid.dx
-        for fl in fls:
-            hgt = fl.surface_h
-            h = np.append(h, hgt)
-            widths = np.append(widths, fl.widths * dx)
-        d['flowline_mean_elev'] = np.average(h, weights=widths)
-        d['flowline_max_elev'] = np.max(h)
-        d['flowline_min_elev'] = np.min(h)
-    except BaseException:
-        pass
-
-    try:
-        # Climate and MB at t*
-        mbcl = ConstantMassBalance
-        mbmod = MultipleFlowlineMassBalance(gdir, mb_model_class=mbcl,
-                                            bias=0,
-                                            use_inversion_flowlines=True)
-        h, w, mbh = mbmod.get_annual_mb_on_flowlines()
-        mbh = mbh * cfg.SEC_IN_YEAR * cfg.PARAMS['ice_density']
-        pacc = np.where(mbh >= 0)
-        pab = np.where(mbh < 0)
-        d['tstar_aar'] = np.sum(w[pacc]) / np.sum(w)
-        try:
-            # Try to get the slope
-            mb_slope, _, _, _, _ = stats.linregress(h[pab], mbh[pab])
-            d['tstar_mb_grad'] = mb_slope
-        except BaseException:
-            # we don't mind if something goes wrong
-            d['tstar_mb_grad'] = np.NaN
-        d['tstar_ela_h'] = mbmod.get_ela()
-        # Climate
-        t, tm, p, ps = mbmod.flowline_mb_models[0].get_climate(
-            [d['tstar_ela_h'],
-             d['flowline_mean_elev'],
-             d['flowline_max_elev'],
-             d['flowline_min_elev']])
-        for n, v in zip(['temp', 'tempmelt', 'prcpsol'], [t, tm, ps]):
-            d['tstar_avg_' + n + '_ela_h'] = v[0]
-            d['tstar_avg_' + n + '_mean_elev'] = v[1]
-            d['tstar_avg_' + n + '_max_elev'] = v[2]
-            d['tstar_avg_' + n + '_min_elev'] = v[3]
-        d['tstar_avg_prcp'] = p[0]
-    except BaseException:
-        pass
-
-    # Climate and MB at specified dates
-    add_climate_period = tolist(add_climate_period)
-    for y0 in add_climate_period:
-        try:
-            fs = '{}-{}'.format(y0 - 15, y0 + 15)
-
-            mbcl = ConstantMassBalance
-            mbmod = MultipleFlowlineMassBalance(gdir, mb_model_class=mbcl,
-                                                y0=y0,
-                                                use_inversion_flowlines=True)
-            h, w, mbh = mbmod.get_annual_mb_on_flowlines()
-            mbh = mbh * cfg.SEC_IN_YEAR * cfg.PARAMS['ice_density']
-            pacc = np.where(mbh >= 0)
-            pab = np.where(mbh < 0)
-            d[fs + '_aar'] = np.sum(w[pacc]) / np.sum(w)
-            try:
-                # Try to get the slope
-                mb_slope, _, _, _, _ = stats.linregress(h[pab], mbh[pab])
-                d[fs + '_mb_grad'] = mb_slope
-            except BaseException:
-                # we don't mind if something goes wrong
-                d[fs + '_mb_grad'] = np.NaN
-            d[fs + '_ela_h'] = mbmod.get_ela()
-            # Climate
-            t, tm, p, ps = mbmod.flowline_mb_models[0].get_climate(
-                [d[fs + '_ela_h'],
-                 d['flowline_mean_elev'],
-                 d['flowline_max_elev'],
-                 d['flowline_min_elev']])
-            for n, v in zip(['temp', 'tempmelt', 'prcpsol'], [t, tm, ps]):
-                d[fs + '_avg_' + n + '_ela_h'] = v[0]
-                d[fs + '_avg_' + n + '_mean_elev'] = v[1]
-                d[fs + '_avg_' + n + '_max_elev'] = v[2]
-                d[fs + '_avg_' + n + '_min_elev'] = v[3]
-            d[fs + '_avg_prcp'] = p[0]
-        except BaseException:
-            pass
-
-    return d
-
-
-def compile_climate_statistics(gdirs, filesuffix='', path=True,
-                               add_climate_period=1995):
-    """Gather as much statistics as possible about a list of glaciers.
-
-    It can be used to do result diagnostics and other stuffs. If the data
-    necessary for a statistic is not available (e.g.: flowlines length) it
-    will simply be ignored.
-
-    Parameters
-    ----------
-    gdirs: the list of GlacierDir to process.
-    filesuffix : str
-        add suffix to output file
-    path : str, bool
-        Set to "True" in order  to store the info in the working directory
-        Set to a path to store the file to your chosen location
-    add_climate_period : int or list of ints
-        compile climate statistics for the 30 yrs period around the selected
-        date.
-    """
-    from oggm.workflow import execute_entity_task
-
-    out_df = execute_entity_task(climate_statistics, gdirs,
-                                 add_climate_period=add_climate_period)
-
-    out = pd.DataFrame(out_df).set_index('rgi_id')
-    if path:
-        if path is True:
-            out.to_csv(os.path.join(cfg.PATHS['working_dir'],
-                                    ('climate_statistics' +
-                                     filesuffix + '.csv')))
-        else:
-            out.to_csv(path)
-    return out
-
-
-def idealized_gdir(surface_h, widths_m, map_dx, flowline_dx=1,
-                   base_dir=None, reset=False):
-    """Creates a glacier directory with flowline input data only.
-
-    This is useful for testing, or for idealized experiments.
-
-    Parameters
-    ----------
-    surface_h : ndarray
-        the surface elevation of the flowline's grid points (in m).
-    widths_m : ndarray
-        the widths of the flowline's grid points (in m).
-    map_dx : float
-        the grid spacing (in m)
-    flowline_dx : int
-        the flowline grid spacing (in units of map_dx, often it should be 1)
-    base_dir : str
-        path to the directory where to open the directory.
-        Defaults to `cfg.PATHS['working_dir'] + /per_glacier/`
-    reset : bool, default=False
-        empties the directory at construction
-
-    Returns
-    -------
-    a GlacierDirectory instance
-    """
-
-    from oggm.core.centerlines import Centerline
-
-    # Area from geometry
-    area_km2 = np.sum(widths_m * map_dx * flowline_dx) * 1e-6
-
-    # Dummy entity - should probably also change the geometry
-    entity = gpd.read_file(get_demo_file('Hintereisferner_RGI5.shp')).iloc[0]
-    entity.Area = area_km2
-    entity.CenLat = 0
-    entity.CenLon = 0
-    entity.Name = ''
-    entity.RGIId = 'RGI50-00.00000'
-    entity.O1Region = '00'
-    entity.O2Region = '0'
-    gdir = GlacierDirectory(entity, base_dir=base_dir, reset=reset)
-    gdir.write_shapefile(gpd.GeoDataFrame([entity]), 'outlines')
-
-    # Idealized flowline
-    coords = np.arange(0, len(surface_h) - 0.5, 1)
-    line = shpg.LineString(np.vstack([coords, coords * 0.]).T)
-    fl = Centerline(line, dx=flowline_dx, surface_h=surface_h, map_dx=map_dx)
-    fl.widths = widths_m / map_dx
-    fl.is_rectangular = np.ones(fl.nx).astype(np.bool)
-    gdir.write_pickle([fl], 'inversion_flowlines')
-
-    # Idealized map
-    grid = salem.Grid(nxny=(1, 1), dxdy=(map_dx, map_dx), x0y0=(0, 0))
-    grid.to_json(gdir.get_filepath('glacier_grid'))
-
-    return gdir
-
-
 def _robust_extract(to_dir, *args, **kwargs):
     """For some obscure reason this operation randomly fails.
 
@@ -1514,7 +375,48 @@ def robust_tar_extract(from_tar, to_dir, delete_tar=False):
         os.remove(from_tar)
 
 
-class GlacierDirectory(object):
+class ncDataset(netCDF4.Dataset):
+    """Wrapper around netCDF4 setting auto_mask to False"""
+
+    def __init__(self, *args, **kwargs):
+        super(ncDataset, self).__init__(*args, **kwargs)
+        self.set_auto_mask(False)
+
+
+class DisableLogger():
+    """Context manager to temporarily disable all loggers."""
+
+    def __enter__(self):
+        logging.disable(logging.ERROR)
+
+    def __exit__(self, a, b, c):
+        logging.disable(logging.NOTSET)
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError('This task was killed because of timeout')
+
+
+
+def _get_centerline_lonlat(gdir):
+    """Quick n dirty solution to write the centerlines as a shapefile"""
+
+    cls = gdir.read_pickle('centerlines')
+    olist = []
+    for j, cl in enumerate(cls[::-1]):
+        mm = 1 if j == 0 else 0
+        gs = dict()
+        gs['RGIID'] = gdir.rgi_id
+        gs['LE_SEGMENT'] = np.rint(np.max(cl.dis_on_line) * gdir.grid.dx)
+        gs['MAIN'] = mm
+        tra_func = partial(gdir.grid.ij_to_crs, crs=wgs84)
+        gs['geometry'] = shp_trafo(tra_func, cl.line)
+        olist.append(gs)
+
+    return olist
+
+
+class GlacierDirectory:
     """Organizes read and write access to the glacier's files.
 
     It handles a glacier directory created in a base directory (default
@@ -1556,20 +458,24 @@ class GlacierDirectory(object):
         Is the glacier a caving glacier?
     inversion_calving_rate : float
         Calving rate used for the inversion
+    last_result : object
+        Result of the last entity_task run on this gdir, if any.
     """
 
-    def __init__(self, rgi_entity, base_dir=None, reset=False,
+    def __init__(self, oggm, rgi_entity, base_dir=None, reset=False,
                  from_tar=False, delete_tar=False):
         """Creates a new directory or opens an existing one.
 
         Parameters
         ----------
+        oggm : an ``oggm.OGGM`` instance
+            OGGM instance this dir belongs to
         rgi_entity : a ``geopandas.GeoSeries`` or str
             glacier entity read from the shapefile (or a valid RGI ID if the
             directory exists)
         base_dir : str
             path to the directory where to open the directory.
-            Defaults to `cfg.PATHS['working_dir'] + /per_glacier/`
+            Defaults to `oggm.PATHS['working_dir'] + /per_glacier/`
         reset : bool, default=False
             empties the directory at construction (careful!)
         from_tar : str or bool, default=False
@@ -1579,10 +485,16 @@ class GlacierDirectory(object):
             delete the original tar file after extraction.
         """
 
+        self.last_result = None
+
+        if oggm is None:
+            raise InvalidParamsError('oggm must not be None')
+        self.oggm = oggm
+
         if base_dir is None:
-            if not cfg.PATHS.get('working_dir', None):
+            if not self.oggm.PATHS.get('working_dir', None):
                 raise ValueError("Need a valid PATHS['working_dir']!")
-            base_dir = os.path.join(cfg.PATHS['working_dir'], 'per_glacier')
+            base_dir = os.path.join(self.oggm.PATHS['working_dir'], 'per_glacier')
 
         # RGI IDs are also valid entries
         if isinstance(rgi_entity, str):
@@ -1626,7 +538,7 @@ class GlacierDirectory(object):
         self.glims_id = rgi_entity.GLIMSId
 
         # Do we want to use the RGI center point or ours?
-        if cfg.PARAMS['use_rgi_area']:
+        if self.oggm.PARAMS['use_rgi_area']:
             self.cenlon = float(rgi_entity.CenLon)
             self.cenlat = float(rgi_entity.CenLat)
         else:
@@ -1783,7 +695,7 @@ class GlacierDirectory(object):
         entity['geometry'] = geometry
 
         # Do we want to use the RGI area or ours?
-        if not cfg.PARAMS['use_rgi_area']:
+        if not self.oggm.PARAMS['use_rgi_area']:
             # Update Area
             area = geometry.area * 1e-6
             entity['Area'] = area
@@ -1799,7 +711,7 @@ class GlacierDirectory(object):
         self.write_shapefile(towrite, 'outlines')
 
         # Also transform the intersects if necessary
-        gdf = cfg.PARAMS['intersects_gdf']
+        gdf = self.oggm.PARAMS['intersects_gdf']
         if len(gdf) > 0:
             gdf = gdf.loc[((gdf.RGIId_1 == self.rgi_id) |
                            (gdf.RGIId_2 == self.rgi_id))]
@@ -1811,13 +723,13 @@ class GlacierDirectory(object):
                 self.write_shapefile(gdf, 'intersects')
         else:
             # Sanity check
-            if cfg.PARAMS['use_intersects']:
+            if self.oggm.PARAMS['use_intersects']:
                 raise InvalidParamsError(
                     'You seem to have forgotten to set the '
                     'intersects file for this run. OGGM '
                     'works better with such a file. If you '
                     'know what your are doing, set '
-                    "cfg.PARAMS['use_intersects'] = False to "
+                    "oggm.PARAMS['use_intersects'] = False to "
                     "suppress this error.")
 
     @lazy_property
@@ -1883,7 +795,7 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         delete : bool
             delete the file if exists
         filesuffix : str
@@ -1895,10 +807,10 @@ class GlacierDirectory(object):
         The absolute path to the desired file
         """
 
-        if filename not in cfg.BASENAMES:
-            raise ValueError(filename + ' not in cfg.BASENAMES.')
+        if filename not in self.oggm.BASENAMES:
+            raise ValueError(filename + ' not in oggm.BASENAMES.')
 
-        fname = cfg.BASENAMES[filename]
+        fname = self.oggm.BASENAMES[filename]
         if filesuffix:
             fname = fname.split('.')
             assert len(fname) == 2
@@ -1922,12 +834,12 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         """
         fp = self.get_filepath(filename, filesuffix=filesuffix)
-        if '.shp' in fp and cfg.PARAMS['use_tar_shapefiles']:
+        if '.shp' in fp and self.oggm.PARAMS['use_tar_shapefiles']:
             fp = fp.replace('.shp', '.tar')
-            if cfg.PARAMS['use_compression']:
+            if self.oggm.PARAMS['use_compression']:
                 fp += '.gz'
 
         out = os.path.exists(fp)
@@ -1946,7 +858,7 @@ class GlacierDirectory(object):
             fp = fp.replace('.json', '.pkl')
             if not os.path.exists(fp):
                 raise FileNotFoundError('No climate info file available!')
-            _open = gzip.open if cfg.PARAMS['use_compression'] else open
+            _open = gzip.open if self.oggm.PARAMS['use_compression'] else open
             with _open(fp, 'rb') as f:
                 out = pickle.load(f)
             return out
@@ -1993,10 +905,10 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         use_compression : bool
             whether or not the file ws compressed. Default is to use
-            cfg.PARAMS['use_compression'] for this (recommended)
+            oggm.PARAMS['use_compression'] for this (recommended)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
 
@@ -2010,7 +922,7 @@ class GlacierDirectory(object):
             return self._read_deprecated_climate_info()
 
         use_comp = (use_compression if use_compression is not None
-                    else cfg.PARAMS['use_compression'])
+                    else self.oggm.PARAMS['use_compression'])
         _open = gzip.open if use_comp else open
         fp = self.get_filepath(filename, filesuffix=filesuffix)
         with _open(fp, 'rb') as f:
@@ -2026,15 +938,15 @@ class GlacierDirectory(object):
         var : object
             the variable to write to disk
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         use_compression : bool
             whether or not the file ws compressed. Default is to use
-            cfg.PARAMS['use_compression'] for this (recommended)
+            oggm.PARAMS['use_compression'] for this (recommended)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
         """
         use_comp = (use_compression if use_compression is not None
-                    else cfg.PARAMS['use_compression'])
+                    else self.oggm.PARAMS['use_compression'])
         _open = gzip.open if use_comp else open
         fp = self.get_filepath(filename, filesuffix=filesuffix)
         with _open(fp, 'wb') as f:
@@ -2046,7 +958,7 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
 
@@ -2072,7 +984,7 @@ class GlacierDirectory(object):
         var : object
             the variable to write to JSON (must be a dictionary)
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
         """
@@ -2112,7 +1024,7 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
 
@@ -2131,9 +1043,9 @@ class GlacierDirectory(object):
         if '.shp' not in fp:
             raise ValueError('File ending not that of a shapefile')
 
-        if cfg.PARAMS['use_tar_shapefiles']:
+        if self.oggm.PARAMS['use_tar_shapefiles']:
             fp = 'tar://' + fp.replace('.shp', '.tar')
-            if cfg.PARAMS['use_compression']:
+            if self.oggm.PARAMS['use_compression']:
                 fp += '.gz'
 
         shp = gpd.read_file(fp)
@@ -2152,7 +1064,7 @@ class GlacierDirectory(object):
         Parameters
         ----------
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
 
@@ -2171,7 +1083,7 @@ class GlacierDirectory(object):
         var : object
             the variable to write to shapefile (must be a geopandas.DataFrame)
         filename : str
-            file name (must be listed in cfg.BASENAME)
+            file name (must be listed in oggm.BASENAME)
         filesuffix : str
             append a suffix to the filename (useful for experiments).
         """
@@ -2180,14 +1092,14 @@ class GlacierDirectory(object):
             raise ValueError('File ending not that of a shapefile')
         var.to_file(fp)
 
-        if not cfg.PARAMS['use_tar_shapefiles']:
+        if not self.oggm.PARAMS['use_tar_shapefiles']:
             # Done here
             return
 
         # Write them in tar
         fp = fp.replace('.shp', '.tar')
         mode = 'w'
-        if cfg.PARAMS['use_compression']:
+        if self.oggm.PARAMS['use_compression']:
             fp += '.gz'
             mode += ':gz'
         if os.path.exists(fp):
@@ -2257,7 +1169,7 @@ class GlacierDirectory(object):
         if source is None:
             raise InvalidParamsError('`source` kwarg is required')
 
-        zlib = cfg.PARAMS['compress_climate_netcdf']
+        zlib = self.oggm.PARAMS['compress_climate_netcdf']
 
         try:
             y0 = time[0].year
@@ -2266,7 +1178,7 @@ class GlacierDirectory(object):
             time = pd.DatetimeIndex(time)
             y0 = time[0].year
             y1 = time[-1].year
-        
+
         if time_unit is None:
             # http://pandas.pydata.org/pandas-docs/stable/timeseries.html
             # #timestamp-limitations
@@ -2294,7 +1206,7 @@ class GlacierDirectory(object):
             nc.author_info = 'Open Global Glacier Model'
 
             timev = nc.createVariable('time', 'i4', ('time',))
-            
+
             tatts = {'units': time_unit}
             if calendar is None:
                 calendar = 'standard'
@@ -2367,7 +1279,7 @@ class GlacierDirectory(object):
 
         if mb_df is None:
 
-            flink, mbdatadir = get_wgms_files()
+            flink, mbdatadir = self.oggm.utils.get_wgms_files()
             c = 'RGI{}0_ID'.format(self.rgi_version[0])
             wid = flink.loc[flink[c] == self.rgi_id]
             if len(wid) == 0:
@@ -2421,7 +1333,7 @@ class GlacierDirectory(object):
         """
 
         if self._mbprofdf is None:
-            flink, mbdatadir = get_wgms_files()
+            flink, mbdatadir = self.oggm.utils.get_wgms_files()
             c = 'RGI{}0_ID'.format(self.rgi_version[0])
             wid = flink.loc[flink[c] == self.rgi_id]
             if len(wid) == 0:
@@ -2459,13 +1371,13 @@ class GlacierDirectory(object):
          For some glaciers only!
          """
 
-        df = pd.read_csv(get_demo_file('rgi_leclercq_links_2012_RGIV5.csv'))
+        df = pd.read_csv(self.oggm.utils.get_demo_file('rgi_leclercq_links_2012_RGIV5.csv'))
         df = df.loc[df.RGI_ID == self.rgi_id]
         if len(df) == 0:
             raise RuntimeError('No length data found for this glacier!')
         ide = df.LID.values[0]
 
-        f = get_demo_file('Glacier_Lengths_Leclercq.nc')
+        f = self.oggm.utils.get_demo_file('Glacier_Lengths_Leclercq.nc')
         with xr.open_dataset(f) as dsg:
             # The database is not sorted by ID. Don't ask me...
             grp_id = np.argwhere(dsg['index'].values == ide)[0][0] + 1
@@ -2601,53 +1513,659 @@ class GlacierDirectory(object):
         return None
 
 
-@entity_task(log)
-def copy_to_basedir(gdir, base_dir=None, setup='run'):
-    """Copies the glacier directories and their content to a new location.
+class EntityTask(ABC):
+    """Abstract base class for common job-controlling logic.
 
-    This utility function allows to select certain files only, thus
-    saving time at copy.
+    All tasks share common operations. This class is here to handle them.
+    Always
+
+    Static Variables
+    ----------
+    log: logger
+        module logger
+    writes: list
+        list of files that the task will write down to disk (must be
+        available in ``oggm.BASENAMES``)
+    """
+    log=log
+    writes=[]
+
+
+    def __init__(self, oggm):
+        self.oggm = oggm
+
+
+    @dask.delayed(pure=False)
+    def run(self, gdir, *, reset=None, print_log=True):
+        """
+        Runs the respective entity task.
+        Always returns the gdir itself, setting gdir.last_result to
+        the tasks result.
+        """
+
+        if gdir.oggm is not self.oggm:
+            raise InvalidParamsError('gdir not bound to tasks oggm instance')
+
+        if reset is None:
+            reset = not self.oggm.PARAMS['auto_skip_task']
+
+        task_name = self.task_name
+
+        # Filesuffix are typically used to differentiate tasks
+        for attr in ['filesuffix', 'output_filesuffix']:
+            try:
+                task_name += getattr(self, attr)
+                break
+            except AttributeError:
+                pass
+
+        # Do we need to run this task?
+        s = gdir.get_task_status(task_name)
+        if not reset and s and ('SUCCESS' in s):
+            gdir.last_result = None
+            return gdir
+
+        # Log what we are doing
+        if print_log:
+            self.log.info('(%s) %s', gdir.rgi_id, task_name)
+
+        # Run the task
+        try:
+            if self.oggm.PARAMS['task_timeout'] > 0:
+                # Might be impossible
+                self.log.warning('TODO: figure out threading-compatible timeouts')
+
+            ex_t = time.time()
+            out = self.execute(gdir, **kwargs)
+            ex_t = time.time() - ex_t
+
+            # If the entity task itself is delayed, measuring time is pointless.
+            if isinstance(out, dask.delayed.Delayed):
+                ex_t = None
+
+            if task_name != 'gdir_to_tar':
+                gdir.log(task_name, task_time=ex_t)
+        except Exception as err:
+            # Something happened
+            gdir.log(task_name, err=err)
+            pipe_log(gdir, task_name, err=err)
+            if print_log:
+                self.log.error('%s occurred during task %s on %s: %s',
+                               type(err).__name__, task_name,
+                               gdir.rgi_id, str(err))
+
+            # Try running fallback
+            try:
+                out = self.fallback(gdir, **kwargs)
+            except NotImplementedError:
+                out = None
+
+            if not self.oggm.PARAMS['continue_on_error']:
+                raise
+
+        grid.last_result = out
+        return gdir
+
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+
+    @property
+    def task_name(self):
+        return type(self).__name__
+
+
+    @abstractmethod
+    def execute(self, gdir):
+        raise NotImplementedError('run needs to be implemented by child class')
+
+
+    def fallback(self, gdir):
+        raise NotImplementedError('no fallback implemented')
+
+
+class EntityTaskResultList(list):
+    def __init__(self, last_result, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_result = last_result
+
+
+class GlobalTask(ABC):
+    """
+    Class for common job-controlling logic.
+
+    Indicates that this task expects a list of all GlacierDirs as parameter
+    instead of being called once per dir.
+
+    A global task _has_ to return immediately, i.e. use only dask.delayed functions
+    internally and thus return either nothing, trivial info, or delayed data.
+
+    Static Variables
+    ----------
+    log: logger
+        module logger
+    writes: list
+        list of files that the task will write down to disk (must be
+        available in ``oggm.BASENAMES``)
+    """
+    log=log
+    writes=[]
+
+
+    def __init__(self, oggm):
+        self.oggm = oggm
+
+
+    def run(self, gdirs):
+        """
+        Runs the global task.
+
+        Returns an EntityTaskResultList
+        """
+        out = self.execute(gdirs)
+        result = None
+        if isinstance(out, tuple):
+            gdirs, result = out
+        else:
+            gdirs = out
+        return EntityTaskResultList(result, gdirs)
+
+
+    def __call__(self, gdirs):
+        return self.run(gdirs, **kwargs)
+
+
+    @property
+    def task_name(self):
+        return type(self).__name__
+
+
+    @abstractmethod
+    def execute(self, gdirs):
+        raise NotImplementedError('run needs to be implemented by child class')
+
+
+def curry_task(task=None):
+    """Task decorator helper
+
+    Allows partial initialization of tasks with kwargs.
+    If the wrapped function gets exactly one positional argument (the oggm instance),
+    it calls right through. If no positional arguments are passed, it returns a wrapper
+    with all kwargs burned in, expecting only the missing oggm parameter.
+    Will throw an error if more than one positional argument was passed.
+    """
+
+    # Accomodate for being decorated like @curry_task()
+    if task is None:
+        return curry_task
+
+    def wrapper(*args, **kwargs):
+        if len(args) == 0:
+            def curried_task(oggm):
+                return task(oggm, **kwargs)
+            return curried_task
+        elif len(args) == 1:
+            return task(*args, **kwargs)
+        raise InvalidParamsError("Tasks only take exactly one positional argument")
+
+    return wrapper
+
+
+def entity_task(func=None, log=log, writes=[], fallback=None):
+    """Simple decorator for simple entity tasks.
 
     Parameters
     ----------
-    gdir : :py:class:`oggm.GlacierDirectory`
-        the glacier directory to copy
-    base_dir : str
-        path to the new base directory (should end with "per_glacier" most
-        of the times)
-    setup : str
-        set up you want the copied directory to be useful for. Currently
-        supported are 'all' (copy the entire directory), 'inversion'
-        (copy the necessary files for the inversion AND the run)
-        and 'run' (copy the necessary files for a dynamical run).
-
-    Returns
-    -------
-    New glacier directories from the copied folders
+    log: logger
+        module logger
+    writes: list
+        list of files that the task will write down to disk (must be
+        available in ``cfg.BASENAMES``)
+    fallback: python function
+        will be executed on gdir if entity_task fails
     """
-    base_dir = os.path.abspath(base_dir)
-    new_dir = os.path.join(base_dir, gdir.rgi_id[:8], gdir.rgi_id[:11],
-                           gdir.rgi_id)
-    if setup == 'run':
-        paths = ['model_flowlines', 'inversion_params', 'outlines',
-                 'local_mustar', 'climate_historical',
-                 'gcm_data', 'climate_info']
-        paths = ('*' + p + '*' for p in paths)
-        shutil.copytree(gdir.dir, new_dir,
-                        ignore=include_patterns(*paths))
-    elif setup == 'inversion':
-        paths = ['inversion_params', 'downstream_line', 'outlines',
-                 'inversion_flowlines', 'glacier_grid',
-                 'local_mustar', 'climate_historical', 'gridded_data',
-                 'gcm_data', 'climate_info']
-        paths = ('*' + p + '*' for p in paths)
-        shutil.copytree(gdir.dir, new_dir,
-                        ignore=include_patterns(*paths))
-    elif setup == 'all':
-        shutil.copytree(gdir.dir, new_dir)
+    class EntityTaskInternal(EntityTask):
+        log=log
+        writes=writes
+
+        def __init__(self, func, oggm, **kwargs):
+            super().__init__(oggm)
+            self.func = func
+            self.kwargs = kwargs
+
+        @property
+        def task_name(self):
+            return self.func.__name__
+
+        def execute(self, gdir):
+            return self.func(gdir, **self.kwargs)
+
+        def fallback(self, gdir):
+            if fallback:
+                return fallback(gdir)
+            raise NotImplementedError('No fallback provided')
+
+    def wrapper(func):
+        return curry_task(partial(EntityTaskInternal, func))
+
+    if func is None:
+        return wrapper
     else:
-        raise ValueError('setup not understood: {}'.format(setup))
-    return GlacierDirectory(gdir.rgi_id, base_dir=base_dir)
+        return wrapper(func)
+
+
+def global_task(func=None):
+    """Simple decorator for simple global tasks.
+
+    Indicates that this task expects a list of all GlacierDirs as parameter
+    instead of being called once per dir.
+    """
+
+    class GlobalTaskInternal(GlobalTask):
+        log=log
+        writes=writes
+
+        def __init__(self, func, oggm, **kwargs):
+            super().__init__(oggm)
+            self.func = func
+            self.kwargs = kwargs
+
+        @property
+        def task_name(self):
+            return self.func.__name__
+
+        def execute(self, gdir):
+            return self.func(gdir, **self.kwargs)
+
+    def wrapper(func):
+        return curry_task(partial(EntityTaskInternal, func))
+
+    if func is None:
+        return wrapper
+    else:
+        return wrapper(func)
+
+
+@curry_task
+class glacier_statistics(EntityTask):
+    """Gather as much statistics as possible about this glacier.
+
+    It can be used to do result diagnostics and other stuffs. If the data
+    necessary for a statistic is not available (e.g.: flowlines length) it
+    will simply be ignored.
+    """
+
+    def __init__(self, oggm):
+        super().__init__(oggm)
+
+
+    def execute(self, gdir, inversion_only=False):
+        """
+        Parameters
+        ----------
+        inversion_only : bool
+            if one wants to summarize the inversion output only (including calving)
+        """
+
+        d = OrderedDict()
+
+        # Easy stats - this should always be possible
+        d['rgi_id'] = gdir.rgi_id
+        d['rgi_region'] = gdir.rgi_region
+        d['rgi_subregion'] = gdir.rgi_subregion
+        d['name'] = gdir.name
+        d['cenlon'] = gdir.cenlon
+        d['cenlat'] = gdir.cenlat
+        d['rgi_area_km2'] = gdir.rgi_area_km2
+        d['glacier_type'] = gdir.glacier_type
+        d['terminus_type'] = gdir.terminus_type
+        d['status'] = gdir.status
+
+        # The rest is less certain. We put these in a try block and see
+        # We're good with any error - we store the dict anyway below
+        # TODO: should be done with more preselected errors
+        try:
+            # Inversion
+            if gdir.has_file('inversion_output'):
+                vol = []
+                cl = gdir.read_pickle('inversion_output')
+                for c in cl:
+                    vol.extend(c['volume'])
+                d['inv_volume_km3'] = np.nansum(vol) * 1e-9
+                area = gdir.rgi_area_km2
+                d['inv_thickness_m'] = d['inv_volume_km3'] / area * 1000
+                d['vas_volume_km3'] = 0.034 * (area ** 1.375)
+                d['vas_thickness_m'] = d['vas_volume_km3'] / area * 1000
+        except BaseException:
+            pass
+
+        try:
+            # Diagnostics
+            diags = gdir.get_diagnostics()
+            for k, v in diags.items():
+                d[k] = v
+        except BaseException:
+            pass
+
+        if inversion_only:
+            return d
+
+        try:
+            # Error log
+            errlog = gdir.get_error_log()
+            if errlog is not None:
+                d['error_task'] = errlog.split(';')[-2]
+                d['error_msg'] = errlog.split(';')[-1]
+            else:
+                d['error_task'] = None
+                d['error_msg'] = None
+        except BaseException:
+            pass
+
+        try:
+            # Masks related stuff
+            fpath = gdir.get_filepath('gridded_data')
+            with ncDataset(fpath) as nc:
+                mask = nc.variables['glacier_mask'][:]
+                topo = nc.variables['topo'][:]
+            d['dem_mean_elev'] = np.mean(topo[np.where(mask == 1)])
+            d['dem_med_elev'] = np.median(topo[np.where(mask == 1)])
+            d['dem_min_elev'] = np.min(topo[np.where(mask == 1)])
+            d['dem_max_elev'] = np.max(topo[np.where(mask == 1)])
+        except BaseException:
+            pass
+
+        try:
+            # Ext related stuff
+            fpath = gdir.get_filepath('gridded_data')
+            with ncDataset(fpath) as nc:
+                ext = nc.variables['glacier_ext'][:]
+                mask = nc.variables['glacier_mask'][:]
+                topo = nc.variables['topo'][:]
+            d['dem_max_elev_on_ext'] = np.max(topo[np.where(ext == 1)])
+            d['dem_min_elev_on_ext'] = np.min(topo[np.where(ext == 1)])
+            a = np.sum(mask & (topo > d['dem_max_elev_on_ext']))
+            d['dem_perc_area_above_max_elev_on_ext'] = a / np.sum(mask)
+        except BaseException:
+            pass
+
+        try:
+            # Centerlines
+            cls = gdir.read_pickle('centerlines')
+            longuest = 0.
+            for cl in cls:
+                longuest = np.max([longuest, cl.dis_on_line[-1]])
+            d['n_centerlines'] = len(cls)
+            d['longuest_centerline_km'] = longuest * gdir.grid.dx / 1000.
+        except BaseException:
+            pass
+
+        try:
+            # Flowline related stuff
+            h = np.array([])
+            widths = np.array([])
+            slope = np.array([])
+            fls = gdir.read_pickle('inversion_flowlines')
+            dx = fls[0].dx * gdir.grid.dx
+            for fl in fls:
+                hgt = fl.surface_h
+                h = np.append(h, hgt)
+                widths = np.append(widths, fl.widths * gdir.grid.dx)
+                slope = np.append(slope, np.arctan(-np.gradient(hgt, dx)))
+                length = len(hgt) * dx
+            d['main_flowline_length'] = length
+            d['inv_flowline_glacier_area'] = np.sum(widths * dx)
+            d['flowline_mean_elev'] = np.average(h, weights=widths)
+            d['flowline_max_elev'] = np.max(h)
+            d['flowline_min_elev'] = np.min(h)
+            d['flowline_avg_width'] = np.mean(widths)
+            d['flowline_avg_slope'] = np.mean(slope)
+        except BaseException:
+            pass
+
+        try:
+            # MB calib
+            df = gdir.read_json('local_mustar')
+            d['t_star'] = df['t_star']
+            d['mu_star_glacierwide'] = df['mu_star_glacierwide']
+            d['mu_star_flowline_avg'] = df['mu_star_flowline_avg']
+            d['mu_star_allsame'] = df['mu_star_allsame']
+            d['mb_bias'] = df['bias']
+        except BaseException:
+            pass
+
+        return d
+
+
+@curry_task
+class climate_statistics(EntityTask):
+    """Gather as much statistics as possible about this glacier.
+
+    It can be used to do result diagnostics and other stuffs. If the data
+    necessary for a statistic is not available (e.g.: flowlines length) it
+    will simply be ignored.
+    """
+
+    def __init__(self, oggm):
+        super().__init__(oggm, log)
+
+
+    def execute(self, gdir, add_climate_period=1995):
+        """
+        Parameters
+        ----------
+        add_climate_period : int or list of ints
+            compile climate statistics for the 30 yrs period around the selected
+            date.
+        """
+
+        from oggm.core.massbalance import (ConstantMassBalance,
+                                           MultipleFlowlineMassBalance)
+
+        d = OrderedDict()
+
+        # Easy stats - this should always be possible
+        d['rgi_id'] = gdir.rgi_id
+        d['rgi_region'] = gdir.rgi_region
+        d['rgi_subregion'] = gdir.rgi_subregion
+        d['name'] = gdir.name
+        d['cenlon'] = gdir.cenlon
+        d['cenlat'] = gdir.cenlat
+        d['rgi_area_km2'] = gdir.rgi_area_km2
+        d['glacier_type'] = gdir.glacier_type
+        d['terminus_type'] = gdir.terminus_type
+        d['status'] = gdir.status
+
+        # The rest is less certain
+
+        try:
+            # Flowline related stuff
+            h = np.array([])
+            widths = np.array([])
+            fls = gdir.read_pickle('inversion_flowlines')
+            dx = fls[0].dx * gdir.grid.dx
+            for fl in fls:
+                hgt = fl.surface_h
+                h = np.append(h, hgt)
+                widths = np.append(widths, fl.widths * dx)
+            d['flowline_mean_elev'] = np.average(h, weights=widths)
+            d['flowline_max_elev'] = np.max(h)
+            d['flowline_min_elev'] = np.min(h)
+        except BaseException:
+            pass
+
+        try:
+            # Climate and MB at t*
+            mbcl = ConstantMassBalance
+            mbmod = MultipleFlowlineMassBalance(gdir, mb_model_class=mbcl,
+                                                bias=0,
+                                                use_inversion_flowlines=True)
+            h, w, mbh = mbmod.get_annual_mb_on_flowlines()
+            mbh = mbh * cfg.SEC_IN_YEAR * self.oggm.PARAMS['ice_density']
+            pacc = np.where(mbh >= 0)
+            pab = np.where(mbh < 0)
+            d['tstar_aar'] = np.sum(w[pacc]) / np.sum(w)
+            try:
+                # Try to get the slope
+                mb_slope, _, _, _, _ = stats.linregress(h[pab], mbh[pab])
+                d['tstar_mb_grad'] = mb_slope
+            except BaseException:
+                # we don't mind if something goes wrong
+                d['tstar_mb_grad'] = np.NaN
+            d['tstar_ela_h'] = mbmod.get_ela()
+            # Climate
+            t, tm, p, ps = mbmod.flowline_mb_models[0].get_climate(
+                [d['tstar_ela_h'],
+                 d['flowline_mean_elev'],
+                 d['flowline_max_elev'],
+                 d['flowline_min_elev']])
+            for n, v in zip(['temp', 'tempmelt', 'prcpsol'], [t, tm, ps]):
+                d['tstar_avg_' + n + '_ela_h'] = v[0]
+                d['tstar_avg_' + n + '_mean_elev'] = v[1]
+                d['tstar_avg_' + n + '_max_elev'] = v[2]
+                d['tstar_avg_' + n + '_min_elev'] = v[3]
+            d['tstar_avg_prcp'] = p[0]
+        except BaseException:
+            pass
+
+        # Climate and MB at specified dates
+        add_climate_period = tolist(add_climate_period)
+        for y0 in add_climate_period:
+            try:
+                fs = '{}-{}'.format(y0 - 15, y0 + 15)
+
+                mbcl = ConstantMassBalance
+                mbmod = MultipleFlowlineMassBalance(gdir, mb_model_class=mbcl,
+                                                    y0=y0,
+                                                    use_inversion_flowlines=True)
+                h, w, mbh = mbmod.get_annual_mb_on_flowlines()
+                mbh = mbh * cfg.SEC_IN_YEAR * self.oggm.PARAMS['ice_density']
+                pacc = np.where(mbh >= 0)
+                pab = np.where(mbh < 0)
+                d[fs + '_aar'] = np.sum(w[pacc]) / np.sum(w)
+                try:
+                    # Try to get the slope
+                    mb_slope, _, _, _, _ = stats.linregress(h[pab], mbh[pab])
+                    d[fs + '_mb_grad'] = mb_slope
+                except BaseException:
+                    # we don't mind if something goes wrong
+                    d[fs + '_mb_grad'] = np.NaN
+                d[fs + '_ela_h'] = mbmod.get_ela()
+                # Climate
+                t, tm, p, ps = mbmod.flowline_mb_models[0].get_climate(
+                    [d[fs + '_ela_h'],
+                     d['flowline_mean_elev'],
+                     d['flowline_max_elev'],
+                     d['flowline_min_elev']])
+                for n, v in zip(['temp', 'tempmelt', 'prcpsol'], [t, tm, ps]):
+                    d[fs + '_avg_' + n + '_ela_h'] = v[0]
+                    d[fs + '_avg_' + n + '_mean_elev'] = v[1]
+                    d[fs + '_avg_' + n + '_max_elev'] = v[2]
+                    d[fs + '_avg_' + n + '_min_elev'] = v[3]
+                d[fs + '_avg_prcp'] = p[0]
+            except BaseException:
+                pass
+
+        return d
+
+
+class copy_to_basedir(EntityTask):
+    """
+    Copies the glacier directories and their content to a new location.
+
+    This utility function allows to select certain files only, thus
+    saving time at copy.
+    """
+
+    def __init__(self, oggm):
+        super().__init__(oggm, log)
+
+
+    def execute(self, gdir, base_dir=None, setup='run'):
+        """
+        Parameters
+        ----------
+        gdir : :py:class:`oggm.GlacierDirectory`
+            the glacier directory to copy
+        base_dir : str
+            path to the new base directory (should end with "per_glacier" most
+            of the times)
+        setup : str
+            set up you want the copied directory to be useful for. Currently
+            supported are 'all' (copy the entire directory), 'inversion'
+            (copy the necessary files for the inversion AND the run)
+            and 'run' (copy the necessary files for a dynamical run).
+
+        Returns
+        -------
+        New glacier directories from the copied folders
+        """
+        base_dir = os.path.abspath(base_dir)
+        new_dir = os.path.join(base_dir, gdir.rgi_id[:8], gdir.rgi_id[:11],
+                               gdir.rgi_id)
+        if setup == 'run':
+            paths = ['model_flowlines', 'inversion_params', 'outlines',
+                     'local_mustar', 'climate_historical',
+                     'gcm_data', 'climate_info']
+            paths = ('*' + p + '*' for p in paths)
+            shutil.copytree(gdir.dir, new_dir,
+                            ignore=include_patterns(*paths))
+        elif setup == 'inversion':
+            paths = ['inversion_params', 'downstream_line', 'outlines',
+                     'inversion_flowlines', 'glacier_grid',
+                     'local_mustar', 'climate_historical', 'gridded_data',
+                     'gcm_data', 'climate_info']
+            paths = ('*' + p + '*' for p in paths)
+            shutil.copytree(gdir.dir, new_dir,
+                            ignore=include_patterns(*paths))
+        elif setup == 'all':
+            shutil.copytree(gdir.dir, new_dir)
+        else:
+            raise ValueError('setup not understood: {}'.format(setup))
+        return GlacierDirectory(gdir.rgi_id, base_dir=base_dir)
+
+
+class gdir_to_tar(EntityTask):
+    """
+    Writes the content of a glacier directory to a tar file.
+
+    The tar file is located at the same location of the original directory.
+    The glacier directory objects are useless if deleted!
+    """
+
+    def __init__(self, oggm):
+        super().__init__(oggm, log)
+
+
+    def execute(self, gdir, base_dir=None, delete=True):
+        """
+        Parameters
+        ----------
+        base_dir : str
+            path to the basedir where to write the directory (defaults to the
+            same location of the original directory)
+        delete : bool
+            delete the original directory afterwards (default)
+
+        Returns
+        -------
+        the path to the tar file
+        """
+
+        source_dir = os.path.normpath(gdir.dir)
+        opath = source_dir + '.tar.gz'
+        if base_dir is not None:
+            opath = os.path.join(base_dir, os.path.relpath(opath, gdir.base_dir))
+            mkdir(os.path.dirname(opath))
+
+        with tarfile.open(opath, "w:gz") as tar:
+            tar.add(source_dir, arcname=os.path.basename(source_dir))
+
+        if delete:
+            shutil.rmtree(source_dir)
+
+        return opath
 
 
 def initialize_merged_gdir(main, tribs=[], glcdf=None,
@@ -2678,6 +2196,10 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
     """
     from oggm.core.gis import define_glacier_region, merged_glacier_masks
 
+    oggm = main.oggm
+    if oggm is None:
+        raise ValueError("Input gdir is not linked to an oggm instance")
+
     # If its a dict, select the relevant ones
     if isinstance(tribs, dict):
         tribs = tribs[main.rgi_id]
@@ -2691,7 +2213,7 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
     # 0. create the new GlacierDirectory from main glaciers GeoDataFrame
     # Should be passed along, if not download it
     if glcdf is None:
-        glcdf = get_rgi_glacier_entities([main.rgi_id])
+        glcdf = oggm.utils.get_rgi_glacier_entities([main.rgi_id])
     # Get index location of the specific glacier
     idx = glcdf.loc[glcdf.RGIId == main.rgi_id].index
     maindf = glcdf.loc[idx].copy()
@@ -2721,10 +2243,10 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
 
     # finally create new Glacier Directory
     # 1. set dx spacing to the one used for the flowlines
-    dx_method = cfg.PARAMS['grid_dx_method']
-    dx_spacing = cfg.PARAMS['fixed_dx']
-    cfg.PARAMS['grid_dx_method'] = 'fixed'
-    cfg.PARAMS['fixed_dx'] = mfls[-1].map_dx
+    dx_method = oggm.PARAMS['grid_dx_method']
+    dx_spacing = oggm.PARAMS['fixed_dx']
+    oggm.PARAMS['grid_dx_method'] = 'fixed'
+    oggm.PARAMS['fixed_dx'] = mfls[-1].map_dx
     merged = GlacierDirectory(maindf.loc[idx].iloc[0])
 
     # run define_glacier_region to get a fitting DEM and proper grid
@@ -2734,8 +2256,8 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
     merged_glacier_masks(merged, merged_geometry)
 
     # reset dx method
-    cfg.PARAMS['grid_dx_method'] = dx_method
-    cfg.PARAMS['fixed_dx'] = dx_spacing
+    oggm.PARAMS['grid_dx_method'] = dx_method
+    oggm.PARAMS['fixed_dx'] = dx_spacing
 
     # copy main climate file, climate info and local_mustar to new gdir
     climfilename = filename + '_' + main.rgi_id + input_filesuffix + '.nc'
@@ -2787,69 +2309,759 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
     return merged
 
 
-@entity_task(log)
-def gdir_to_tar(gdir, base_dir=None, delete=True):
-    """Writes the content of a glacier directory to a tar file.
+def compile_to_netcdf(log):
+    """Decorator for common compiling NetCDF files logic.
 
-    The tar file is located at the same location of the original directory.
-    The glacier directory objects are useless if deleted!
-
-    Parameters
-    ----------
-    base_dir : str
-        path to the basedir where to write the directory (defaults to the
-        same location of the original directory)
-    delete : bool
-        delete the original directory afterwards (default)
-
-    Returns
-    -------
-    the path to the tar file
-    """
-
-    source_dir = os.path.normpath(gdir.dir)
-    opath = source_dir + '.tar.gz'
-    if base_dir is not None:
-        opath = os.path.join(base_dir, os.path.relpath(opath, gdir.base_dir))
-        mkdir(os.path.dirname(opath))
-
-    with tarfile.open(opath, "w:gz") as tar:
-        tar.add(source_dir, arcname=os.path.basename(source_dir))
-
-    if delete:
-        shutil.rmtree(source_dir)
-
-    return opath
-
-
-def base_dir_to_tar(base_dir=None, delete=True):
-    """Merge the directories into 1000 bundles as tar files.
-
-    The tar file is located at the same location of the original directory.
+    All compile_* tasks can be optimized the same way, by using temporary
+    files and merging them afterwards.
 
     Parameters
     ----------
-    base_dir : str
-        path to the basedir to parse (defaults to the working directory)
-    to_base_dir : str
-        path to the basedir where to write the directory (defaults to the
-        same location of the original directory)
-    delete : bool
-        delete the original directory tars afterwards (default)
+    log: logger
+        module logger
     """
 
-    if base_dir is None:
-        if not cfg.PATHS.get('working_dir', None):
-            raise ValueError("Need a valid PATHS['working_dir']!")
-        base_dir = os.path.join(cfg.PATHS['working_dir'], 'per_glacier')
+    def decorator(task_func):
 
-    for dirname, subdirlist, filelist in os.walk(base_dir):
-        # RGI60-01.00
-        bname = os.path.basename(dirname)
-        if not (len(bname) == 11 and bname[-3] == '.'):
-            continue
-        opath = dirname + '.tar'
-        with tarfile.open(opath, 'w') as tar:
-            tar.add(dirname, arcname=os.path.basename(dirname))
-        if delete:
-            shutil.rmtree(dirname)
+        @wraps(task_func)
+        def _compile_to_netcdf(self, gdirs, filesuffix='', input_filesuffix='',
+                               output_filesuffix='', path=True,
+                               tmp_file_size=1000,
+                               *args, **kwargs):
+
+            # Check input
+            if filesuffix:
+                warnings.warn('The `filesuffix` kwarg is deprecated for '
+                              'compile_* tasks. Use input_filesuffix from '
+                              'now on.',
+                              DeprecationWarning)
+                input_filesuffix = filesuffix
+
+            if not output_filesuffix:
+                output_filesuffix = input_filesuffix
+
+            gdirs = tolist(gdirs)
+
+            hemisphere = [gd.hemisphere for gd in gdirs]
+            if len(np.unique(hemisphere)) == 2:
+                if path is not True:
+                    raise InvalidParamsError('With glaciers from both '
+                                             'hemispheres, set `path=True`.')
+                log.warning('compile_*: you gave me a list of gdirs from '
+                                 'both hemispheres. I am going to write two '
+                                 'files out of it with _sh and _nh suffixes.')
+                _gdirs = [gd for gd in gdirs if gd.hemisphere == 'sh']
+                _compile_to_netcdf(self, _gdirs,
+                                   input_filesuffix=input_filesuffix,
+                                   output_filesuffix=output_filesuffix + '_sh',
+                                   path=True,
+                                   tmp_file_size=tmp_file_size,
+                                   *args, **kwargs)
+                _gdirs = [gd for gd in gdirs if gd.hemisphere == 'nh']
+                _compile_to_netcdf(self, _gdirs,
+                                   input_filesuffix=input_filesuffix,
+                                   output_filesuffix=output_filesuffix + '_nh',
+                                   path=True,
+                                   tmp_file_size=tmp_file_size,
+                                   *args, **kwargs)
+                return
+
+            task_name = task_func.__name__
+            output_base = task_name.replace('compile_', '')
+
+            if path is True:
+                path = os.path.join(self.oggm.PATHS['working_dir'],
+                                    output_base + output_filesuffix + '.nc')
+
+            log.info('Applying %s on %d gdirs.',
+                          task_name, len(gdirs))
+
+            # Run the task
+            # If small gdir size, no need for temporary files
+            if len(gdirs) < tmp_file_size or not path:
+                return task_func(self, gdirs, input_filesuffix=input_filesuffix,
+                                 path=path, *args, **kwargs)
+
+            # Otherwise, divide and conquer
+            sub_gdirs = [gdirs[i: i + tmp_file_size] for i in
+                         range(0, len(gdirs), tmp_file_size)]
+
+            tmp_paths = [os.path.join(self.oggm.PATHS['working_dir'],
+                                      'compile_tmp_{:06d}.nc'.format(i))
+                         for i in range(len(sub_gdirs))]
+
+            try:
+                for spath, sgdirs in zip(tmp_paths, sub_gdirs):
+                    task_func(self, sgdirs, input_filesuffix=input_filesuffix,
+                              path=spath, **kwargs)
+            except BaseException:
+                # If something wrong, delete the tmp files
+                for f in tmp_paths:
+                    try:
+                        os.remove(f)
+                    except FileNotFoundError:
+                        pass
+                raise
+
+            # Ok, now merge and return
+            try:
+                with xr.open_mfdataset(tmp_paths, combine='nested',
+                                       concat_dim='rgi_id') as ds:
+                    ds.to_netcdf(path)
+            except TypeError:
+                # xr < v 0.13
+                with xr.open_mfdataset(tmp_paths, concat_dim='rgi_id') as ds:
+                    ds.to_netcdf(path)
+
+            # We can't return the dataset without loading it, so we don't
+            return None
+
+        return _compile_to_netcdf
+
+    return decorator
+
+
+class Workflow:
+    def __init__(self, oggm, **kwargs):
+        self.oggm = oggm
+
+
+    def empty_cache(self):
+        """Empty oggm's cache directory."""
+
+        if os.path.exists(self.oggm.CACHE_DIR):
+            shutil.rmtree(self.oggm.CACHE_DIR)
+        os.makedirs(self.oggm.CACHE_DIR)
+
+
+    def pipe_log(self, gdir, task_func_name, err=None):
+        """Log the error in a specific directory."""
+
+        time_str = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+        # Defaults to working directory: it must be set!
+        if not self.oggm.PATHS['working_dir']:
+            warnings.warn("Cannot log to file without a valid "
+                          "oggm.PATHS['working_dir']!", RuntimeWarning)
+            return
+
+        fpath = os.path.join(self.oggm.PATHS['working_dir'], 'log')
+        mkdir(fpath)
+
+        fpath = os.path.join(fpath, gdir.rgi_id)
+
+        sep = '; '
+
+        if err is not None:
+            fpath += '.ERROR'
+        else:
+            return  # for now
+            fpath += '.SUCCESS'
+
+        with open(fpath, 'a') as f:
+            f.write(time_str + sep + task_func_name + sep)
+            if err is not None:
+                f.write(err.__class__.__name__ + sep + '{}\n'.format(err))
+            else:
+                f.write(sep + '\n')
+
+
+    def write_centerlines_to_shape(self, gdirs, filesuffix='', path=True):
+        """Write the centerlines in a shapefile.
+
+        Parameters
+        ----------
+        gdirs: the list of GlacierDir to process.
+        filesuffix : str
+            add suffix to output file
+        path:
+            Set to "True" in order  to store the info in the working directory
+            Set to a path to store the file to your chosen location
+        """
+
+        if path is True:
+            path = os.path.join(self.oggm.PATHS['working_dir'],
+                                'glacier_centerlines' + filesuffix + '.shp')
+
+        olist = []
+        for gdir in gdirs:
+            try:
+                olist.extend(_get_centerline_lonlat(gdir))
+            except FileNotFoundError:
+                pass
+
+        odf = gpd.GeoDataFrame(olist)
+        odf = odf.sort_values(by='RGIID')
+        odf.crs = {'init': 'epsg:4326'}
+        odf.to_file(path)
+
+
+    def demo_glacier_id(self, key):
+        """Get the RGI id of a glacier by name or key: None if not found."""
+
+        df = self.oggm.DATA['demo_glaciers']
+
+        # Is the name in key?
+        s = df.loc[df.Key.str.lower() == key.lower()]
+        if len(s) == 1:
+            return s.index[0]
+
+        # Is the name in name?
+        s = df.loc[df.Name.str.lower() == key.lower()]
+        if len(s) == 1:
+            return s.index[0]
+
+        # Is the name in Ids?
+        try:
+            s = df.loc[[key]]
+            if len(s) == 1:
+                return s.index[0]
+        except KeyError:
+            pass
+
+        return None
+
+    def base_dir_to_tar(self, base_dir=None, delete=True):
+        """Merge the directories into 1000 bundles as tar files.
+
+        The tar file is located at the same location of the original directory.
+
+        Parameters
+        ----------
+        base_dir : str
+            path to the basedir to parse (defaults to the working directory)
+        to_base_dir : str
+            path to the basedir where to write the directory (defaults to the
+            same location of the original directory)
+        delete : bool
+            delete the original directory tars afterwards (default)
+        """
+
+        if base_dir is None:
+            if not self.oggm.PATHS.get('working_dir', None):
+                raise ValueError("Need a valid PATHS['working_dir']!")
+            base_dir = os.path.join(self.oggm.PATHS['working_dir'], 'per_glacier')
+
+        for dirname, subdirlist, filelist in os.walk(base_dir):
+            # RGI60-01.00
+            bname = os.path.basename(dirname)
+            if not (len(bname) == 11 and bname[-3] == '.'):
+                continue
+            opath = dirname + '.tar'
+            with tarfile.open(opath, 'w') as tar:
+                tar.add(dirname, arcname=os.path.basename(dirname))
+            if delete:
+                shutil.rmtree(dirname)
+
+
+    def idealized_gdir(self, surface_h, widths_m, map_dx, flowline_dx=1,
+                       base_dir=None, reset=False):
+        """Creates a glacier directory with flowline input data only.
+
+        This is useful for testing, or for idealized experiments.
+
+        Parameters
+        ----------
+        surface_h : ndarray
+            the surface elevation of the flowline's grid points (in m).
+        widths_m : ndarray
+            the widths of the flowline's grid points (in m).
+        map_dx : float
+            the grid spacing (in m)
+        flowline_dx : int
+            the flowline grid spacing (in units of map_dx, often it should be 1)
+        base_dir : str
+            path to the directory where to open the directory.
+            Defaults to `oggm.PATHS['working_dir'] + /per_glacier/`
+        reset : bool, default=False
+            empties the directory at construction
+
+        Returns
+        -------
+        a GlacierDirectory instance
+        """
+
+        from oggm.core.centerlines import Centerline
+
+        # Area from geometry
+        area_km2 = np.sum(widths_m * map_dx * flowline_dx) * 1e-6
+
+        # Dummy entity - should probably also change the geometry
+        entity = gpd.read_file(self.oggm.utils.get_demo_file('Hintereisferner_RGI5.shp')).iloc[0]
+        entity.Area = area_km2
+        entity.CenLat = 0
+        entity.CenLon = 0
+        entity.Name = ''
+        entity.RGIId = 'RGI50-00.00000'
+        entity.O1Region = '00'
+        entity.O2Region = '0'
+        gdir = GlacierDirectory(self.oggm, entity, base_dir=base_dir, reset=reset)
+        gdir.write_shapefile(gpd.GeoDataFrame([entity]), 'outlines')
+
+        # Idealized flowline
+        coords = np.arange(0, len(surface_h) - 0.5, 1)
+        line = shpg.LineString(np.vstack([coords, coords * 0.]).T)
+        fl = Centerline(line, dx=flowline_dx, surface_h=surface_h, map_dx=map_dx)
+        fl.widths = widths_m / map_dx
+        fl.is_rectangular = np.ones(fl.nx).astype(np.bool)
+        gdir.write_pickle([fl], 'inversion_flowlines')
+
+        # Idealized map
+        grid = salem.Grid(nxny=(1, 1), dxdy=(map_dx, map_dx), x0y0=(0, 0))
+        grid.to_json(gdir.get_filepath('glacier_grid'))
+
+        return gdir
+
+
+    def compile_glacier_statistics(self, gdirs, filesuffix='', path=True,
+                                   inversion_only=False):
+        """Gather as much statistics as possible about a list of glaciers.
+
+        It can be used to do result diagnostics and other stuffs. If the data
+        necessary for a statistic is not available (e.g.: flowlines length) it
+        will simply be ignored.
+
+        Parameters
+        ----------
+        gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+            the glacier directories to process
+        filesuffix : str
+            add suffix to output file
+        path : str, bool
+            Set to "True" in order  to store the info in the working directory
+            Set to a path to store the file to your chosen location
+        inversion_only : bool
+            if one wants to summarize the inversion output only (including calving)
+        """
+
+        out_df = self.oggm.execute_entity_task(glacier_statistics(inversion_only=inversion_only), gdirs)
+
+        @dask.delayed
+        def compile_internal(out_df):
+            out = pd.DataFrame(out_df).set_index('rgi_id')
+            if path:
+                if path is True:
+                    out.to_csv(os.path.join(self.oggm.PATHS['working_dir'],
+                                            ('glacier_statistics' + filesuffix + '.csv')))
+                else:
+                    out.to_csv(path)
+            return out
+
+        return compile_internal(out_df)
+
+
+    def compile_climate_statistics(self, gdirs, filesuffix='', path=True,
+                                   add_climate_period=1995):
+        """Gather as much statistics as possible about a list of glaciers.
+
+        It can be used to do result diagnostics and other stuffs. If the data
+        necessary for a statistic is not available (e.g.: flowlines length) it
+        will simply be ignored.
+
+        Parameters
+        ----------
+        gdirs: the list of GlacierDir to process.
+        filesuffix : str
+            add suffix to output file
+        path : str, bool
+            Set to "True" in order  to store the info in the working directory
+            Set to a path to store the file to your chosen location
+        add_climate_period : int or list of ints
+            compile climate statistics for the 30 yrs period around the selected
+            date.
+        """
+
+        out_df = self.oggm.execute_entity_task(climate_statistics, gdirs,
+                                               add_climate_period=add_climate_period)
+
+        out = pd.DataFrame(out_df).set_index('rgi_id')
+        if path:
+            if path is True:
+                out.to_csv(os.path.join(self.oggm.PATHS['working_dir'],
+                                        ('climate_statistics' +
+                                         filesuffix + '.csv')))
+            else:
+                out.to_csv(path)
+        return out
+
+
+    def compile_task_log(self, gdirs, task_names=[], filesuffix='', path=True,
+                         append=True):
+        """Gathers the log output for the selected task(s)
+
+        Parameters
+        ----------
+        gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+            the glacier directories to process
+        task_names : list of str
+            The tasks to check for
+        filesuffix : str
+            add suffix to output file
+        path:
+            Set to `True` in order  to store the info in the working directory
+            Set to a path to store the file to your chosen location
+            Set to `False` to omit disk storage
+        append:
+            If a task log file already exists in the working directory, the new
+            logs will be added to the existing file
+
+        Returns
+        -------
+        out : :py:class:`pandas.DataFrame`
+            log output
+        """
+
+        out_df = []
+        for gdir in gdirs:
+            d = OrderedDict()
+            d['rgi_id'] = gdir.rgi_id
+            for task_name in task_names:
+                ts = gdir.get_task_status(task_name)
+                if ts is None:
+                    ts = ''
+                d[task_name] = ts.replace(',', ' ')
+            out_df.append(d)
+
+        out = pd.DataFrame(out_df).set_index('rgi_id')
+        if path:
+            if path is True:
+                path = os.path.join(self.oggm.PATHS['working_dir'],
+                                    'task_log' + filesuffix + '.csv')
+            if os.path.exists(path) and append:
+                odf = pd.read_csv(path, index_col=0)
+                out = odf.join(out, rsuffix='_n')
+            out.to_csv(path)
+        return out
+
+
+    def compile_task_time(self, gdirs, task_names=[], filesuffix='', path=True,
+                          append=True):
+        """Gathers the time needed for the selected task(s) to run
+
+        Parameters
+        ----------
+        gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+            the glacier directories to process
+        task_names : list of str
+            The tasks to check for
+        filesuffix : str
+            add suffix to output file
+        path:
+            Set to `True` in order  to store the info in the working directory
+            Set to a path to store the file to your chosen location
+            Set to `False` to omit disk storage
+        append:
+            If a task log file already exists in the working directory, the new
+            logs will be added to the existing file
+
+        Returns
+        -------
+        out : :py:class:`pandas.DataFrame`
+            log output
+        """
+
+        out_df = []
+        for gdir in gdirs:
+            d = OrderedDict()
+            d['rgi_id'] = gdir.rgi_id
+            for task_name in task_names:
+                d[task_name] = gdir.get_task_time(task_name)
+            out_df.append(d)
+
+        out = pd.DataFrame(out_df).set_index('rgi_id')
+        if path:
+            if path is True:
+                path = os.path.join(self.oggm.PATHS['working_dir'],
+                                    'task_time' + filesuffix + '.csv')
+            if os.path.exists(path) and append:
+                odf = pd.read_csv(path, index_col=0)
+                out = odf.join(out, rsuffix='_n')
+            out.to_csv(path)
+        return out
+
+
+    @compile_to_netcdf(log)
+    def compile_run_output(self, gdirs, path=True, input_filesuffix='',
+                           use_compression=True):
+        """Merge the output of the model runs of several gdirs into one file.
+
+        Parameters
+        ----------
+        gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+            the glacier directories to process
+        path : str
+            where to store (default is on the working dir).
+            Set to `False` to disable disk storage.
+        input_filesuffix : str
+            the filesuffix of the files to be compiled
+        use_compression : bool
+            use zlib compression on the output netCDF files
+
+        Returns
+        -------
+        ds : :py:class:`xarray.Dataset`
+            compiled output
+        """
+
+        # Get the dimensions of all this
+        rgi_ids = [gd.rgi_id for gd in gdirs]
+
+        # The first gdir might have blown up, try some others
+        i = 0
+        while True:
+            if i >= len(gdirs):
+                raise RuntimeError('Found no valid glaciers!')
+            try:
+                ppath = gdirs[i].get_filepath('model_diagnostics',
+                                              filesuffix=input_filesuffix)
+                with xr.open_dataset(ppath) as ds_diag:
+                    ds_diag.time.values
+                break
+            except BaseException:
+                i += 1
+
+        # OK found it, open it and prepare the output
+        with xr.open_dataset(ppath) as ds_diag:
+            time = ds_diag.time.values
+            yrs = ds_diag.hydro_year.values
+            months = ds_diag.hydro_month.values
+            cyrs = ds_diag.calendar_year.values
+            cmonths = ds_diag.calendar_month.values
+
+            # Prepare output
+            ds = xr.Dataset()
+
+            # Global attributes
+            ds.attrs['description'] = 'OGGM model output'
+            ds.attrs['oggm_version'] = __version__
+            ds.attrs['calendar'] = '365-day no leap'
+            ds.attrs['creation_date'] = strftime("%Y-%m-%d %H:%M:%S", gmtime())
+
+            # Coordinates
+            ds.coords['time'] = ('time', time)
+            ds.coords['rgi_id'] = ('rgi_id', rgi_ids)
+            ds.coords['hydro_year'] = ('time', yrs)
+            ds.coords['hydro_month'] = ('time', months)
+            ds.coords['calendar_year'] = ('time', cyrs)
+            ds.coords['calendar_month'] = ('time', cmonths)
+            ds['time'].attrs['description'] = 'Floating hydrological year'
+            ds['rgi_id'].attrs['description'] = 'RGI glacier identifier'
+            ds['hydro_year'].attrs['description'] = 'Hydrological year'
+            ds['hydro_month'].attrs['description'] = 'Hydrological month'
+            ds['calendar_year'].attrs['description'] = 'Calendar year'
+            ds['calendar_month'].attrs['description'] = 'Calendar month'
+
+        shape = (len(time), len(rgi_ids))
+        # These variables are always available
+        vol = np.zeros(shape)
+        area = np.zeros(shape)
+        length = np.zeros(shape)
+        ela = np.zeros(shape)
+        # These are not
+        calving_m3 = None
+        calving_rate_myr = None
+        volume_bsl_m3 = None
+        volume_bwl_m3 = None
+        for i, gdir in enumerate(gdirs):
+            try:
+                ppath = gdir.get_filepath('model_diagnostics',
+                                          filesuffix=input_filesuffix)
+                with xr.open_dataset(ppath) as ds_diag:
+                    vol[:, i] = ds_diag.volume_m3.values
+                    area[:, i] = ds_diag.area_m2.values
+                    length[:, i] = ds_diag.length_m.values
+                    ela[:, i] = ds_diag.ela_m.values
+                    if 'calving_m3' in ds_diag:
+                        if calving_m3 is None:
+                            calving_m3 = np.zeros(shape) * np.NaN
+                        calving_m3[:, i] = ds_diag.calving_m3.values
+                    if 'calving_rate_myr' in ds_diag:
+                        if calving_rate_myr is None:
+                            calving_rate_myr = np.zeros(shape) * np.NaN
+                        calving_rate_myr[:, i] = ds_diag.calving_rate_myr.values
+                    if 'volume_bsl_m3' in ds_diag:
+                        if volume_bsl_m3 is None:
+                            volume_bsl_m3 = np.zeros(shape) * np.NaN
+                        volume_bsl_m3[:, i] = ds_diag.volume_bsl_m3.values
+                    if 'volume_bwl_m3' in ds_diag:
+                        if volume_bwl_m3 is None:
+                            volume_bwl_m3 = np.zeros(shape) * np.NaN
+                        volume_bwl_m3[:, i] = ds_diag.volume_bwl_m3.values
+            except BaseException:
+                vol[:, i] = np.NaN
+                area[:, i] = np.NaN
+                length[:, i] = np.NaN
+                ela[:, i] = np.NaN
+
+        ds['volume'] = (('time', 'rgi_id'), vol)
+        ds['volume'].attrs['description'] = 'Total glacier volume'
+        ds['volume'].attrs['units'] = 'm 3'
+        ds['area'] = (('time', 'rgi_id'), area)
+        ds['area'].attrs['description'] = 'Total glacier area'
+        ds['area'].attrs['units'] = 'm 2'
+        ds['length'] = (('time', 'rgi_id'), length)
+        ds['length'].attrs['description'] = 'Glacier length'
+        ds['length'].attrs['units'] = 'm'
+        ds['ela'] = (('time', 'rgi_id'), ela)
+        ds['ela'].attrs['description'] = 'Glacier Equilibrium Line Altitude (ELA)'
+        ds['ela'].attrs['units'] = 'm a.s.l'
+        if calving_m3 is not None:
+            ds['calving'] = (('time', 'rgi_id'), calving_m3)
+            ds['calving'].attrs['description'] = ('Total calving volume since '
+                                                  'simulation start')
+            ds['calving'].attrs['units'] = 'm3'
+        if calving_rate_myr is not None:
+            ds['calving_rate'] = (('time', 'rgi_id'), calving_rate_myr)
+            ds['calving_rate'].attrs['description'] = 'Instantaneous calving rate'
+            ds['calving_rate'].attrs['units'] = 'm yr-1'
+        if volume_bsl_m3 is not None:
+            ds['volume_bsl'] = (('time', 'rgi_id'), volume_bsl_m3)
+            ds['volume_bsl'].attrs['description'] = ('Total glacier volume below '
+                                                     'sea level')
+            ds['volume_bsl'].attrs['units'] = 'm3'
+        if volume_bwl_m3 is not None:
+            ds['volume_bwl'] = (('time', 'rgi_id'), volume_bwl_m3)
+            ds['volume_bwl'].attrs['description'] = ('Total glacier volume below '
+                                                     'water level')
+            ds['volume_bwl'].attrs['units'] = 'm3'
+
+        if path:
+            enc_var = {'dtype': 'float32'}
+            if use_compression:
+                enc_var['complevel'] = 5
+                enc_var['zlib'] = True
+            encoding = {v: enc_var for v in ['volume', 'area', 'length', 'ela']}
+            ds.to_netcdf(path, encoding=encoding)
+
+        return ds
+
+
+    @compile_to_netcdf(log)
+    def compile_climate_input(self, gdirs, path=True, filename='climate_historical',
+                              input_filesuffix='', use_compression=True):
+        """Merge the climate input files in the glacier directories into one file.
+
+        Parameters
+        ----------
+        gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+            the glacier directories to process
+        path : str
+            where to store (default is on the working dir).
+            Set to `False` to disable disk storage.
+        filename : str
+            BASENAME of the climate input files
+        input_filesuffix : str
+            the filesuffix of the files to be compiled
+        use_compression : bool
+            use zlib compression on the output netCDF files
+
+        Returns
+        -------
+        ds : :py:class:`xarray.Dataset`
+            compiled climate data
+        """
+
+        # Get the dimensions of all this
+        rgi_ids = [gd.rgi_id for gd in gdirs]
+
+        # The first gdir might have blown up, try some others
+        i = 0
+        while True:
+            if i >= len(gdirs):
+                raise RuntimeError('Found no valid glaciers!')
+            try:
+                pgdir = gdirs[i]
+                ppath = pgdir.get_filepath(filename=filename,
+                                           filesuffix=input_filesuffix)
+                with xr.open_dataset(ppath) as ds_clim:
+                    ds_clim.time.values
+                # If this worked, we have a valid gdir
+                break
+            except BaseException:
+                i += 1
+
+        with xr.open_dataset(ppath) as ds_clim:
+            cyrs = ds_clim['time.year']
+            cmonths = ds_clim['time.month']
+            has_grad = 'gradient' in ds_clim.variables
+            sm = self.oggm.PARAMS['hydro_month_' + pgdir.hemisphere]
+            yrs, months = calendardate_to_hydrodate(cyrs, cmonths, start_month=sm)
+            assert months[0] == 1, 'Expected the first hydro month to be 1'
+            time = date_to_floatyear(yrs, months)
+
+        # Prepare output
+        ds = xr.Dataset()
+
+        # Global attributes
+        ds.attrs['description'] = 'OGGM model output'
+        ds.attrs['oggm_version'] = __version__
+        ds.attrs['calendar'] = '365-day no leap'
+        ds.attrs['creation_date'] = strftime("%Y-%m-%d %H:%M:%S", gmtime())
+
+        # Coordinates
+        ds.coords['time'] = ('time', time)
+        ds.coords['rgi_id'] = ('rgi_id', rgi_ids)
+        ds.coords['hydro_year'] = ('time', yrs)
+        ds.coords['hydro_month'] = ('time', months)
+        ds.coords['calendar_year'] = ('time', cyrs)
+        ds.coords['calendar_month'] = ('time', cmonths)
+        ds['time'].attrs['description'] = 'Floating hydrological year'
+        ds['rgi_id'].attrs['description'] = 'RGI glacier identifier'
+        ds['hydro_year'].attrs['description'] = 'Hydrological year'
+        ds['hydro_month'].attrs['description'] = 'Hydrological month'
+        ds['calendar_year'].attrs['description'] = 'Calendar year'
+        ds['calendar_month'].attrs['description'] = 'Calendar month'
+
+        shape = (len(time), len(rgi_ids))
+        temp = np.zeros(shape) * np.NaN
+        prcp = np.zeros(shape) * np.NaN
+        if has_grad:
+            grad = np.zeros(shape) * np.NaN
+        ref_hgt = np.zeros(len(rgi_ids)) * np.NaN
+        ref_pix_lon = np.zeros(len(rgi_ids)) * np.NaN
+        ref_pix_lat = np.zeros(len(rgi_ids)) * np.NaN
+
+        for i, gdir in enumerate(gdirs):
+            try:
+                ppath = gdir.get_filepath(filename=filename,
+                                          filesuffix=input_filesuffix)
+                with xr.open_dataset(ppath) as ds_clim:
+                    prcp[:, i] = ds_clim.prcp.values
+                    temp[:, i] = ds_clim.temp.values
+                    if has_grad:
+                        grad[:, i] = ds_clim.gradient
+                    ref_hgt[i] = ds_clim.ref_hgt
+                    ref_pix_lon[i] = ds_clim.ref_pix_lon
+                    ref_pix_lat[i] = ds_clim.ref_pix_lat
+            except BaseException:
+                pass
+
+        ds['temp'] = (('time', 'rgi_id'), temp)
+        ds['temp'].attrs['units'] = 'DegC'
+        ds['temp'].attrs['description'] = '2m Temperature at height ref_hgt'
+        ds['prcp'] = (('time', 'rgi_id'), prcp)
+        ds['prcp'].attrs['units'] = 'kg m-2'
+        ds['prcp'].attrs['description'] = 'total monthly precipitation amount'
+        if has_grad:
+            ds['grad'] = (('time', 'rgi_id'), grad)
+            ds['grad'].attrs['units'] = 'degC m-1'
+            ds['grad'].attrs['description'] = 'temperature gradient'
+        ds['ref_hgt'] = ('rgi_id', ref_hgt)
+        ds['ref_hgt'].attrs['units'] = 'm'
+        ds['ref_hgt'].attrs['description'] = 'reference height'
+        ds['ref_pix_lon'] = ('rgi_id', ref_pix_lon)
+        ds['ref_pix_lon'].attrs['description'] = 'longitude'
+        ds['ref_pix_lat'] = ('rgi_id', ref_pix_lat)
+        ds['ref_pix_lat'].attrs['description'] = 'latitude'
+
+        if path:
+            enc_var = {'dtype': 'float32'}
+            if use_compression:
+                enc_var['complevel'] = 5
+                enc_var['zlib'] = True
+            vars = ['temp', 'prcp']
+            if has_grad:
+                vars += ['grad']
+            encoding = {v: enc_var for v in vars}
+            ds.to_netcdf(path, encoding=encoding)
+        return ds

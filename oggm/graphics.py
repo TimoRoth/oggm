@@ -27,7 +27,7 @@ except ImportError:
     HAS_HCL_CMAP = False
 
 from oggm.core.flowline import FileModel
-from oggm import cfg, utils
+from oggm import utils
 from oggm.core import gis
 
 # Module logger
@@ -189,7 +189,7 @@ def _plot_map(plotfunc):
             plt.tight_layout()
 
         if autosave:
-            savefig = os.path.join(cfg.PATHS['working_dir'], 'plots')
+            savefig = os.path.join(gdirs[0].oggm.PATHS['working_dir'], 'plots')
             utils.mkdir(savefig)
             savefig = os.path.join(savefig, plotfunc.__name__ + '_' +
                                    gdirs[0].rgi_id + '.png')

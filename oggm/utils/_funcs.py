@@ -7,6 +7,7 @@ import sys
 import math
 import logging
 import warnings
+from functools import partial
 from distutils.version import LooseVersion
 
 # External libs
@@ -25,15 +26,11 @@ except ImportError:
     pass
 
 # Locals
-import oggm.cfg as cfg
 from oggm.cfg import SEC_IN_YEAR, SEC_IN_MONTH
-from oggm.utils._downloads import get_demo_file
 from oggm.exceptions import InvalidParamsError, InvalidGeometryError
 
 # Module logger
 log = logging.getLogger('.'.join(__name__.split('.')[:-1]))
-
-_RGI_METADATA = dict()
 
 # Shape factors
 # TODO: how to handle zeta > 10? at the moment extrapolation
@@ -51,36 +48,40 @@ ADHIKARI_FACTORS_PARABOLIC = interp1d(_ADHIKARI_TABLE_ZETAS,
                                       fill_value='extrapolate')
 
 
-def parse_rgi_meta(version=None):
-    """Read the meta information (region and sub-region names)"""
+class Funcs:
+    def __init__(self, oggm, **kwargs):
+        self.oggm = oggm
+        self._RGI_METADATA = dict()
 
-    global _RGI_METADATA
 
-    if version is None:
-        version = cfg.PARAMS['rgi_version']
+    def parse_rgi_meta(self, version=None):
+        """Read the meta information (region and sub-region names)"""
 
-    if version in _RGI_METADATA:
-        return _RGI_METADATA[version]
+        if version is None:
+            version = self.oggm.PARAMS['rgi_version']
 
-    # Parse RGI metadata
-    reg_names = pd.read_csv(get_demo_file('rgi_regions.csv'), index_col=0)
-    if version in ['4', '5']:
-        # The files where different back then
-        subreg_names = pd.read_csv(get_demo_file('rgi_subregions_V5.csv'),
-                                   index_col=0)
-    else:
-        f = os.path.join(get_demo_file('rgi_subregions_'
-                                       'V{}.csv'.format(version)))
-        subreg_names = pd.read_csv(f)
-        subreg_names.index = ['{:02d}-{:02d}'.format(s1, s2) for s1, s2 in
-                              zip(subreg_names['O1'], subreg_names['O2'])]
-        subreg_names = subreg_names[['Full_name']]
+        if version in self._RGI_METADATA:
+            return self._RGI_METADATA[version]
 
-    # For idealized
-    reg_names.loc[0] = ['None']
-    subreg_names.loc['00-00'] = ['None']
-    _RGI_METADATA[version] = (reg_names, subreg_names)
-    return _RGI_METADATA[version]
+        # Parse RGI metadata
+        reg_names = pd.read_csv(self.get_demo_file('rgi_regions.csv'), index_col=0)
+        if version in ['4', '5']:
+            # The files where different back then
+            subreg_names = pd.read_csv(self.get_demo_file('rgi_subregions_V5.csv'),
+                                       index_col=0)
+        else:
+            f = os.path.join(self.get_demo_file('rgi_subregions_'
+                                           'V{}.csv'.format(version)))
+            subreg_names = pd.read_csv(f)
+            subreg_names.index = ['{:02d}-{:02d}'.format(s1, s2) for s1, s2 in
+                                  zip(subreg_names['O1'], subreg_names['O2'])]
+            subreg_names = subreg_names[['Full_name']]
+
+        # For idealized
+        reg_names.loc[0] = ['None']
+        subreg_names.loc['00-00'] = ['None']
+        self._RGI_METADATA[version] = (reg_names, subreg_names)
+        return self._RGI_METADATA[version]
 
 
 def query_yes_no(question, default="yes"):  # pragma: no cover
@@ -118,6 +119,9 @@ def query_yes_no(question, default="yes"):  # pragma: no cover
                              "(or 'y' or 'n').\n")
 
 
+tuple2int = partial(np.array, dtype=np.int64)
+
+
 def tolist(arg, length=None):
     """Makes sure that arg is a list."""
 
@@ -132,7 +136,6 @@ def tolist(arg, length=None):
     arg = list(arg)
 
     if length is not None:
-
         if len(arg) == 1:
             arg *= length
         elif len(arg) == length:
