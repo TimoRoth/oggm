@@ -47,6 +47,8 @@ class Workflow:
         if not task:
             raise InvalidParamsError('task is invalid')
 
+        # TODO: What if the entirety of gdirs is one dask.delayed?
+
         # Should be iterable
         gdirs = utils.tolist(gdirs)
         tasks = utils.tolist(task)
